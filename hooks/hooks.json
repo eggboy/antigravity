@@ -1,0 +1,20 @@
+{
+  "stop-bell": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "if command -v afplay >/dev/null 2>&1; then (afplay -v 1.0 /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &) ; else tput bel >/dev/tty; fi; echo '{}'",
+        "timeout": 10
+      }
+    ]
+  },
+  "show-reasoning": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./show-reasoning/show_reasoning.py --apps jetski,app,ide,cli",
+        "timeout": 10
+      }
+    ]
+  }
+}

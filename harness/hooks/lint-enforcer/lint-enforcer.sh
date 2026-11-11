@@ -7,15 +7,15 @@
 # workspace when the agent's execution loop terminates (end of turn).
 # Pure bash + jq. The idle path (nothing relevant changed) costs two forks:
 # one jq to read the payload and one `git status`. The only thing written is
-# a small per-workspace state file under $TMPDIR that lets idle turns skip
-# the linters; the host owns the audit trail (transcript), so the hook keeps
-# no log of its own.
+# a small per-workspace state file under $TMPDIR (last verdict + status) that
+# lets idle turns skip the linters; the host owns the audit trail
+# (transcript), so the hook keeps no log of its own.
 #
 # Antigravity contract (jetski-customizations/docs/hooks.md):
 #   * Event `Stop` (flat handler list). The host runs the command with the
 #     working directory set to the directory containing hooks.json, so the
 #     project roots come from the payload's `workspacePaths` — every entry is
-#     linted (multi-root aware).
+#     linted (multi-root aware; a root may be a sub-directory of a git repo).
 #   * stdin : JSON — workspacePaths, terminationReason, executionNum, ...
 #   * stdout: exactly one JSON object, always (an invalid verdict is a host
 #     error that is shown to the user):
@@ -26,31 +26,35 @@
 #   * stderr: diagnostics only — captured by the host, not shown on success.
 #
 # Posture: lint is a best-effort control, so the hook fails OPEN. Missing jq,
-# an unparseable payload, an unreadable workspace or a crashing tool all end
-# in {} — never in a non-zero exit, never in a hang (per-tool timeouts plus
-# the hooks.json timeout). The verdict is deterministic: it depends only on
-# the working tree and the state file, never on wall-clock time.
+# an unparseable payload, an unreadable workspace, a missing linter or a
+# crashing tool all end in {} — never in a non-zero exit, never in a hang
+# (per-tool timeouts plus the hooks.json timeout). The verdict is
+# deterministic: it depends only on the working tree and the state file,
+# never on wall-clock time.
 #
 # Fast path, per workspace (each step returns early):
 #   L0  SKIP env, payload (one jq), terminationReason gate
 #   L1  toolchain marker globs                              no fork
-#   L2  `git status --porcelain -uall` empty → clean tree   one fork
+#   L2  `git status --short -uall -- .` empty → clean tree  one fork
 #   L4  no dirty path belongs to an enabled toolchain       no fork
-#   L3  same status as the last run and no relevant dirty   one find
-#       file modified since → idle turn
+#   L3  same status as the last run, no relevant dirty file one find
+#       modified since, and the last verdict was clean (or
+#       cannot be enforced now) → idle turn
 #   L5  linters
 #
 # Modes:
-#   warn  (default) evaluate-only: autofix runs, findings go to stderr, the
-#                   answer is {} — not enforcement.
-#   block           enforcement: on findings answer decision:continue, but
+#   block (default) enforcement: on findings answer decision:continue, but
 #                   only for a normal completion (NO_TOOL_CALL) and while
 #                   executionNum <= LINT_ENFORCER_MAX_CONTINUES, so a fix
-#                   loop that never converges cannot trap the agent.
+#                   loop that never converges cannot trap the agent. A
+#                   failing verdict is remembered and re-enforced on the next
+#                   enforceable Stop even if nothing changed in between.
+#   warn            evaluate-only: autofix runs, findings go to stderr, the
+#                   answer is {} — not enforcement.
 #
 # Env vars (hooks.json has no env field — prefix the command string):
 #   SKIP_LINT_ENFORCER           true to disable entirely
-#   LINT_ENFORCER_MODE           warn|block                 (default: warn)
+#   LINT_ENFORCER_MODE           block|warn                 (default: block)
 #   LINT_ENFORCER_LANGS          comma list                 (default: spring_maven,python_uv,terraform,dockerfile,github_actions)
 #   LINT_ENFORCER_SKIP_AUTOFIX   true to skip the formatter step (check only)
 #   LINT_ENFORCER_TIMEOUT_SEC    per-tool override          (defaults: mvn 240, ruff 30, tf 60, hadolint 30, actionlint 30)
@@ -58,6 +62,9 @@
 #   LINT_ENFORCER_EXCERPT_CHARS  block: tail of linter output quoted in the reason (default: 3000, 0 = none)
 #   LINT_ENFORCER_STATE_DIR      state files                (default: $TMPDIR/antigravity-lint-enforcer)
 #   LINT_ENFORCER_DEBUG          true to print the layer trace to stderr
+#
+# Manual run: `cd <project> && LINT_ENFORCER_DEBUG=true bash lint-enforcer.sh`
+# from an interactive shell lints $PWD and prints the layer trace.
 
 set -uo pipefail
 
@@ -75,7 +82,7 @@ trap emit_noop EXIT
 # ---------------------------------------------------------------------------
 [[ "${SKIP_LINT_ENFORCER:-}" == "true" ]] && exit 0
 
-MODE="${LINT_ENFORCER_MODE:-warn}"
+MODE="${LINT_ENFORCER_MODE:-block}"
 LANGS_CSV="${LINT_ENFORCER_LANGS:-spring_maven,python_uv,terraform,dockerfile,github_actions}"
 MAX_CONTINUES="${LINT_ENFORCER_MAX_CONTINUES:-3}"
 EXCERPT_CHARS="${LINT_ENFORCER_EXCERPT_CHARS:-3000}"
@@ -84,7 +91,7 @@ DEBUG="${LINT_ENFORCER_DEBUG:-}"
 SKIP_AUTOFIX="${LINT_ENFORCER_SKIP_AUTOFIX:-}"
 TIMEOUT_OVERRIDE="${LINT_ENFORCER_TIMEOUT_SEC:-}"
 
-case "$MODE" in warn|block) ;; *) MODE="warn" ;; esac
+case "$MODE" in warn|block) ;; *) MODE="block" ;; esac
 [[ "$MAX_CONTINUES" =~ ^[0-9]+$ ]] || MAX_CONTINUES=3
 [[ "$EXCERPT_CHARS" =~ ^[0-9]+$ ]] || EXCERPT_CHARS=3000
 
@@ -97,19 +104,18 @@ TIMEOUT_BIN=""
 if command -v timeout &>/dev/null; then TIMEOUT_BIN="timeout"
 elif command -v gtimeout &>/dev/null; then TIMEOUT_BIN="gtimeout"
 fi
-# Bounds the no-git directory walks so a misfire on a huge tree can't block
-# Stop for minutes. Empty when no timeout binary is available.
-FIND_TIMEOUT_PREFIX=""
-[[ -n "$TIMEOUT_BIN" ]] && FIND_TIMEOUT_PREFIX="$TIMEOUT_BIN 10"
 
 # ---------------------------------------------------------------------------
-# L0: payload — one jq call. No payload at all (manual shell run) → lint $PWD.
+# L0: payload — one jq call. An interactive shell (no payload) lints $PWD;
+# a non-interactive caller that sends nothing gets {}.
 # ---------------------------------------------------------------------------
-INPUT=""
-[[ -t 0 ]] || IFS= read -r -d '' INPUT || true
-
 TERM_REASON=""; EXEC_NUM=1; WORKSPACES=()
-if [[ -n "$INPUT" ]]; then
+if [[ -t 0 ]]; then
+  WORKSPACES=("$PWD")
+else
+  INPUT=""
+  IFS= read -r -d '' INPUT || true
+  [[ -z "$INPUT" ]] && { trace "L0: empty payload; exit"; exit 0; }
   _parsed=$(jq -r '
     (.terminationReason // ""),
     ((.executionNum // 1) | tostring),
@@ -124,8 +130,6 @@ if [[ -n "$INPUT" ]]; then
     esac
     _i=$((_i + 1))
   done <<< "$_parsed"
-else
-  WORKSPACES=("$PWD")
 fi
 [[ "$EXEC_NUM" =~ ^[0-9]+$ ]] || EXEC_NUM=1
 (( ${#WORKSPACES[@]} == 0 )) && { trace "L0: payload has no workspacePaths; exit"; exit 0; }
@@ -137,7 +141,9 @@ fi
 #   anything else            MAX_INVOCATIONS, ERROR, TERMINAL_STEP_TYPE (the
 #                            agent is waiting on the user), budget limits...
 #                            Still lint (autofix) but never force the loop to
-#                            re-enter against the executor's decision.
+#                            re-enter against the executor's decision; a
+#                            failing verdict is remembered for the next
+#                            enforceable Stop.
 # Matched case-insensitively; MODEL_STOP is the name used by some public docs.
 # ---------------------------------------------------------------------------
 CAN_CONTINUE=0
@@ -154,8 +160,12 @@ if [[ "$MODE" == "block" ]] && (( EXEC_NUM > MAX_CONTINUES )); then
   trace "L0: executionNum=$EXEC_NUM > max continues $MAX_CONTINUES; will not force continue"
   CAN_CONTINUE=0
 fi
+# Enforcing now = block mode on an enforceable stop. Decides whether an
+# unchanged-but-failing workspace is re-linted or left alone.
+ENFORCING=0
+[[ "$MODE" == "block" ]] && (( CAN_CONTINUE )) && ENFORCING=1
 
-trace "mode=$MODE langs=$LANGS_CSV term=$TERM_REASON exec=$EXEC_NUM workspaces=${#WORKSPACES[@]}"
+trace "mode=$MODE langs=$LANGS_CSV term=$TERM_REASON exec=$EXEC_NUM enforcing=$ENFORCING workspaces=${#WORKSPACES[@]}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -174,9 +184,23 @@ state_key() {
   printf -v KEY '%s.%08x' "$tail" "$h"
 }
 
-# Last writer wins; a concurrent (torn) read can only differ from the
-# current status, which means one extra lint pass — never a wrong skip.
-save_state() { printf '%s' "$PORC" > "$STATE_FILE" 2>/dev/null || true; }
+# State file = "<clean|failed>\n<status text>". Last writer wins; a torn
+# concurrent read can only differ from the live status, which means one
+# extra lint pass — never a wrong skip.
+save_state() { printf '%s\n%s' "$1" "$PORC" > "$STATE_FILE" 2>/dev/null || true; }
+
+# May an unchanged workspace be skipped, given the previous verdict?
+#   clean                                → yes
+#   failed, but not enforcing right now  → yes (nothing new to say)
+#   failed and enforcing                 → no: lint again to re-enforce
+#   no / unknown state                   → no
+idle_skip() {
+  case "$PREV_VERDICT" in
+    clean)  return 0 ;;
+    failed) (( ENFORCING == 0 )) ;;
+    *)      return 1 ;;
+  esac
+}
 
 run_with_timeout() {
   local secs="$1"; shift
@@ -196,26 +220,28 @@ fail() {
   note "$1"
 }
 
-# No-git L4 gate: is any file matching $1 (a find -name expression) newer
-# than the state file? Prunes heavy dirs by name at any depth and is bounded
-# by the timeout prefix (on timeout nothing is printed → "not changed", the
-# safe bias).
+# Directory walks (no-git gate, Dockerfile discovery) prune heavy dirs by
+# name at any depth and are bounded to 10s so a misfire on a huge tree can't
+# block Stop for minutes; on timeout they print nothing, the safe bias.
+PRUNE=( \( -name .git -o -name node_modules -o -name vendor
+           -o -name .venv -o -name venv -o -name .tox
+           -o -name target -o -name build -o -name dist
+           -o -name .gradle -o -name .mvn -o -name .terraform
+           -o -name .next -o -name .cache
+           -o -name Library -o -name .Trash -o -name .npm
+           -o -name .nvm -o -name .rustup -o -name .cargo \) -prune -o )
+
+# has_newer <name pattern>...: any file matching one of the patterns newer
+# than the state file?
 has_newer() {
-  local result
-  result=$(eval "$FIND_TIMEOUT_PREFIX find . \
-    \\( -name .git -o -name node_modules -o -name vendor \
-       -o -name .venv -o -name venv -o -name .tox \
-       -o -name target -o -name build -o -name dist \
-       -o -name .gradle -o -name .mvn -o -name .terraform \
-       -o -name .next -o -name .cache \
-       -o -name Library -o -name .Trash -o -name .npm \
-       -o -name .nvm -o -name .rustup -o -name .cargo \
-    \\) -prune -o -type f \\( $1 \\) -newer \"$STATE_FILE\" -print -quit 2>/dev/null")
-  [[ -n "$result" ]]
+  local expr=() p
+  for p in "$@"; do expr+=( ${expr[@]+-o} -name "$p" ); done
+  [[ -n "$(run_with_timeout 10 find . "${PRUNE[@]}" -type f \( "${expr[@]}" \) \
+             -newer "$STATE_FILE" -print -quit 2>/dev/null)" ]]
 }
 
 # ---------------------------------------------------------------------------
-# L5: linters (run from $HOOK_CWD)
+# L5: linters (run from $HOOK_CWD). A missing tool is a skip, never a failure.
 # ---------------------------------------------------------------------------
 run_spring() {
   command -v mvn &>/dev/null || { note "[spring] mvn not on PATH; skip"; return 0; }
@@ -226,20 +252,33 @@ run_spring() {
   else
     apply="spring-javaformat:apply"; check="spring-javaformat:validate"
   fi
+  # apply formats everything check would flag, so a successful apply is the
+  # verdict; the second JVM is only needed in check-only mode.
   if [[ -z "$SKIP_AUTOFIX" ]]; then
-    capture "$t" mvn -q -B "$apply" || { fail "mvn $apply failed"; return 0; }
+    capture "$t" mvn -q -B "$apply" || fail "mvn $apply failed"
+  else
+    capture "$t" mvn -q -B "$check" || fail "mvn $check reported violations (fix: mvn $apply)"
   fi
-  capture "$t" mvn -q -B "$check" || fail "mvn $check reported violations (fix: mvn $apply)"
 }
 
 run_python() {
-  command -v uv &>/dev/null || { note "[python] uv not on PATH; skip"; return 0; }
-  local t="${TIMEOUT_OVERRIDE:-30}"
-  if [[ -z "$SKIP_AUTOFIX" ]]; then
-    capture "$t" uv run --no-sync ruff format . || fail "ruff format failed"
-    capture "$t" uv run --no-sync ruff check --fix . || true
+  local t="${TIMEOUT_OVERRIDE:-30}" ruff=()
+  # ruff from the project environment, else a system ruff; neither → skip
+  # (uv alone is not enough: `uv run ruff` fails closed when ruff is absent).
+  if command -v uv &>/dev/null && capture 10 uv run --no-sync ruff --version; then
+    ruff=(uv run --no-sync ruff)
+  elif command -v ruff &>/dev/null; then
+    ruff=(ruff)
+  else
+    note "[python] ruff not available (uv run ruff / ruff); skip"; return 0
   fi
-  capture "$t" uv run --no-sync ruff check . || fail "ruff check reported issues"
+  if [[ -z "$SKIP_AUTOFIX" ]]; then
+    capture "$t" "${ruff[@]}" format . || fail "ruff format failed"
+    # `check --fix` exits non-zero and prints what it could not fix.
+    capture "$t" "${ruff[@]}" check --fix . || fail "ruff check reported issues"
+  else
+    capture "$t" "${ruff[@]}" check . || fail "ruff check reported issues"
+  fi
 }
 
 run_terraform() {
@@ -257,20 +296,12 @@ run_terraform() {
 run_docker() {
   command -v hadolint &>/dev/null || { note "[docker] hadolint not on PATH; skip"; return 0; }
   local t="${TIMEOUT_OVERRIDE:-30}" f files=()
-  # Dockerfile* + Containerfile* anywhere in the tree, heavy dirs pruned at
-  # any depth, bounded by the timeout prefix. No mapfile: macOS bash 3.2.
+  # Dockerfile* + Containerfile* anywhere in the tree. No mapfile: bash 3.2.
   while IFS= read -r f; do
     [[ -n "$f" ]] && files+=("$f")
-  done < <(
-    eval "$FIND_TIMEOUT_PREFIX find . \
-      \\( -name .git -o -name node_modules -o -name vendor \
-         -o -name .venv -o -name venv -o -name target \
-         -o -name build -o -name dist -o -name .gradle \
-         -o -name .mvn -o -name .terraform -o -name .next -o -name .cache \
-      \\) -prune -o \
-      -type f \\( -name 'Dockerfile' -o -name 'Dockerfile.*' \
-              -o -name 'Containerfile' -o -name 'Containerfile.*' \\) -print 2>/dev/null"
-  )
+  done < <(run_with_timeout 10 find . "${PRUNE[@]}" -type f \
+             \( -name Dockerfile -o -name 'Dockerfile.*' -o -name Containerfile -o -name 'Containerfile.*' \) \
+             -print 2>/dev/null)
   (( ${#files[@]} == 0 )) && { note "[docker] no Dockerfile/Containerfile found; skip"; return 0; }
   capture "$t" hadolint "${files[@]}" || fail "hadolint reported issues"
 }
@@ -295,15 +326,14 @@ lint_workspace() {
   trace "cwd=$HOOK_CWD"
 
   # -------------------------------------------------------------------------
-  # L1: marker checks — pure bash, no fork
+  # L1: marker checks — pure bash, no fork. Globs reach two levels deep
+  # (./infra/*.tf, ./services/api/Dockerfile); literal words keep the arrays
+  # non-empty under set -u on bash 3.2.
   # -------------------------------------------------------------------------
   HAS_POM=0; [[ -f pom.xml ]] && HAS_POM=1
   HAS_PY=0;  [[ -f pyproject.toml ]] && HAS_PY=1
   shopt -s nullglob
-  _tf=( *.tf ); HAS_TF=$(( ${#_tf[@]} > 0 ))
-  # Dockerfile at root or up to two levels deep (./docker/Dockerfile,
-  # ./services/api/Dockerfile.dev, ...). Literal words keep the array
-  # non-empty under set -u on bash 3.2.
+  _tf=( *.tf */*.tf */*/*.tf ); HAS_TF=$(( ${#_tf[@]} > 0 ))
   _docker=( Dockerfile Dockerfile.* Containerfile Containerfile.* \
             */Dockerfile */Dockerfile.* */Containerfile */Containerfile.* \
             */*/Dockerfile */*/Dockerfile.* )
@@ -342,13 +372,25 @@ lint_workspace() {
   [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR" 2>/dev/null || true
   state_key "$HOOK_CWD"
   STATE_FILE="$STATE_DIR/$KEY.state"
+  PREV_VERDICT=""; PREV_PORC=""
+  if [[ -f "$STATE_FILE" ]]; then
+    local state=""
+    IFS= read -r -d '' state < "$STATE_FILE" || true
+    PREV_VERDICT="${state%%$'\n'*}"
+    [[ "$state" == *$'\n'* ]] && PREV_PORC="${state#*$'\n'}"
+  fi
 
   # -------------------------------------------------------------------------
-  # L2: one git status — clean tree? (also tells us whether this is a repo;
-  # -uall lists files inside new untracked directories individually)
+  # L2: one git status — clean tree? (also tells us whether this is a repo).
+  # `--short` with relativePaths forced on and colour forced off is the
+  # porcelain format with paths relative to the workspace, so a workspace
+  # that is a sub-directory of a repo sees only its own changes; `-- .`
+  # scopes the walk; -uall lists files inside new untracked directories.
   # -------------------------------------------------------------------------
   HAS_GIT=0; PORC=""
-  if command -v git &>/dev/null && PORC=$(git status --porcelain -uall 2>/dev/null); then
+  if command -v git &>/dev/null \
+     && PORC=$(git -c status.relativePaths=true -c color.status=false \
+                   status --short -uall -- . 2>/dev/null); then
     HAS_GIT=1
     [[ -z "$PORC" ]] && { trace "L2: working tree clean"; return 0; }
   fi
@@ -380,34 +422,34 @@ lint_workspace() {
       esac
       (( hit )) && RELEVANT+=("$path")
     done <<< "$PORC"
-    if (( ${#RELEVANT[@]} == 0 )); then
-      trace "L4: no relevant files changed"; save_state; return 0
-    fi
+    (( ${#RELEVANT[@]} == 0 )) && { trace "L4: no relevant files changed"; return 0; }
     # -----------------------------------------------------------------------
     # L3: same status as the last run and none of the relevant files modified
-    # since → idle turn. The state file is written AFTER the linters ran, so
-    # formatter rewrites never trigger a redundant pass.
+    # since. Skip only if the last verdict allows it (see idle_skip). The
+    # state file is written AFTER the linters ran, so formatter rewrites never
+    # trigger a redundant pass.
     # -----------------------------------------------------------------------
-    if [[ -f "$STATE_FILE" ]]; then
-      local prev=""
-      IFS= read -r -d '' prev < "$STATE_FILE" || true
-      if [[ "$prev" == "$PORC" ]] \
-         && [[ -z "$(find "${RELEVANT[@]}" -newer "$STATE_FILE" -print -quit 2>/dev/null)" ]]; then
-        trace "L3: unchanged since last run"; return 0
-      fi
+    if [[ -n "$PREV_VERDICT" && "$PREV_PORC" == "$PORC" ]] \
+       && [[ -z "$(find "${RELEVANT[@]}" -newer "$STATE_FILE" -print -quit 2>/dev/null)" ]]; then
+      idle_skip && { trace "L3: unchanged since last run (verdict: $PREV_VERDICT)"; return 0; }
+      trace "L3: unchanged but last verdict failed; re-enforcing"
     fi
-  elif [[ -f "$STATE_FILE" ]]; then
+  elif [[ -n "$PREV_VERDICT" ]]; then
     # No git, but a previous run to compare against: per-toolchain mtime gate.
-    (( WANT_SPRING )) && has_newer '-name "*.java"'                   && RUN_SPRING=1
-    (( WANT_PY ))     && has_newer '-name "*.py"'                     && RUN_PY=1
-    (( WANT_TF ))     && has_newer '-name "*.tf" -o -name "*.tfvars"' && RUN_TF=1
-    (( WANT_DOCKER )) && has_newer '-name "Dockerfile" -o -name "Dockerfile.*" -o -name "Containerfile" -o -name "Containerfile.*"' && RUN_DOCKER=1
+    (( WANT_SPRING )) && has_newer '*.java'           && RUN_SPRING=1
+    (( WANT_PY ))     && has_newer '*.py'             && RUN_PY=1
+    (( WANT_TF ))     && has_newer '*.tf' '*.tfvars'  && RUN_TF=1
+    (( WANT_DOCKER )) && has_newer Dockerfile 'Dockerfile.*' Containerfile 'Containerfile.*' && RUN_DOCKER=1
     if (( WANT_GHA )) && [[ -n "$(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
                                    -newer "$STATE_FILE" -print -quit 2>/dev/null)" ]]; then
       RUN_GHA=1
     fi
-    (( RUN_SPRING || RUN_PY || RUN_TF || RUN_DOCKER || RUN_GHA )) \
-      || { trace "L4: no relevant files changed (mtime)"; save_state; return 0; }
+    if (( !(RUN_SPRING || RUN_PY || RUN_TF || RUN_DOCKER || RUN_GHA) )); then
+      idle_skip && { trace "L4: nothing newer than last run (verdict: $PREV_VERDICT)"; return 0; }
+      trace "L4: nothing newer but last verdict failed; re-enforcing"
+      RUN_SPRING=$WANT_SPRING; RUN_PY=$WANT_PY; RUN_TF=$WANT_TF
+      RUN_DOCKER=$WANT_DOCKER; RUN_GHA=$WANT_GHA
+    fi
   else
     # No git and no prior state — first run on a fresh project: run everything.
     RUN_SPRING=$WANT_SPRING; RUN_PY=$WANT_PY; RUN_TF=$WANT_TF
@@ -423,15 +465,21 @@ lint_workspace() {
   (( RUN_TF ))     && run_terraform
   (( RUN_DOCKER )) && run_docker
   (( RUN_GHA ))    && run_actions
-  # Re-read the status so formatter rewrites are part of the remembered state.
-  # The state file is created first so that, should STATE_DIR live inside the
-  # repo, it is an untracked entry in this snapshot and in every later one.
+  local n=$(( ${#FAILURES[@]} - WS_FAIL_START )) i section verdict=clean
+  (( n > 0 )) && verdict=failed
+  # Remember the verdict with the status as it is now (formatter rewrites
+  # included). The state file is created first so that, should STATE_DIR live
+  # inside the repo, it is an untracked entry in this snapshot and every later
+  # one.
   : > "$STATE_FILE" 2>/dev/null || true
-  (( HAS_GIT )) && { PORC=$(git status --porcelain -uall 2>/dev/null) || true; }
-  save_state
+  if (( HAS_GIT )); then
+    PORC=$(git -c status.relativePaths=true -c color.status=false \
+               status --short -uall -- . 2>/dev/null) || true
+  fi
+  save_state "$verdict"
+  trace "L5: $verdict ($n failure category/ies)"
 
-  local n=$(( ${#FAILURES[@]} - WS_FAIL_START )) i section
-  (( n == 0 )) && { trace "L5: clean"; return 0; }
+  (( n == 0 )) && return 0
   section="Workspace $HOOK_CWD — $n failure category/ies:"
   for (( i = WS_FAIL_START; i < ${#FAILURES[@]}; i++ )); do
     section+="$NL • ${FAILURES[$i]}"
@@ -445,15 +493,15 @@ lint_workspace() {
 # ---------------------------------------------------------------------------
 NL=$'\n'
 FAILURES=(); REASON=""; DETAILS=""; OUT=""; KEY=""; WS_FAIL_START=0
+PREV_VERDICT=""; PREV_PORC=""; PORC=""; STATE_FILE=""
 
 for _ws in "${WORKSPACES[@]}"; do
   lint_workspace "$_ws"
 done
 
 (( ${#FAILURES[@]} )) || exit 0
-[[ "$MODE" == "block" ]] || exit 0
-if (( CAN_CONTINUE == 0 )); then
-  trace "block: ${#FAILURES[@]} failure(s) but not forcing continue (termination=$TERM_REASON execution=$EXEC_NUM)"
+if (( ENFORCING == 0 )); then
+  trace "${#FAILURES[@]} failure(s) but not enforcing (mode=$MODE termination=$TERM_REASON execution=$EXEC_NUM)"
   exit 0
 fi
 

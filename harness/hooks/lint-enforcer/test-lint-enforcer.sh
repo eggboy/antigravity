@@ -206,6 +206,18 @@ printf '%s' "$HOOK_STDERR" | grep -q 'no workspacePaths' && ok "trace: no worksp
 [[ $HOOK_MS -lt 200 ]] && ok "<200ms (got ${HOOK_MS}ms)" || bad "<200ms" "got ${HOOK_MS}ms"
 
 # ---------------------------------------------------------------------------
+hdr "L0: empty non-interactive stdin is a no-op, not a \$PWD lint"
+# ---------------------------------------------------------------------------
+# Only an interactive shell (tty stdin) gets the manual-run $PWD fallback.
+touch "$SANDBOX_ROOT/pom.xml"
+out=$( cd "$SANDBOX_ROOT" && LINT_ENFORCER_STATE_DIR="$SANDBOX_ROOT/empty.state" LINT_ENFORCER_DEBUG=true \
+       "$HOOK" </dev/null 2>"$SANDBOX_ROOT/empty.err" )
+rm -f "$SANDBOX_ROOT/pom.xml"
+[[ "$out" == "{}" ]] && ok "answers {}" || bad "empty stdin stdout" "stdout='$out'"
+grep -q 'empty payload' "$SANDBOX_ROOT/empty.err" && ok "trace: empty payload" \
+  || bad "empty payload trace" "stderr='$(cat "$SANDBOX_ROOT/empty.err")'"
+
+# ---------------------------------------------------------------------------
 hdr "L1: no markers → {} and silent (<200ms)"
 # ---------------------------------------------------------------------------
 cwd=$(mk_sandbox no-markers)
@@ -262,7 +274,7 @@ assert_noop
 [[ $HOOK_MS -lt 150 ]] && ok "<150ms (got ${HOOK_MS}ms): bash + jq + one git status" \
   || bad "<150ms" "got ${HOOK_MS}ms"
 n_state=$(find "$(state_dir_of "$cwd")" -type f | wc -l | tr -d ' ')
-[[ "$n_state" == "1" ]] && ok "exactly one state file written" || bad "state files" "$(ls -A "$(state_dir_of "$cwd")")"
+[[ "$n_state" == "0" ]] && ok "nothing written: no verdict was produced" || bad "state files" "$(ls -A "$(state_dir_of "$cwd")")"
 
 # ---------------------------------------------------------------------------
 hdr "L3: identical dirty set and no edits → second run skips (no timer involved)"
@@ -351,13 +363,18 @@ hdr "Warn mode (evaluate-only): findings never block — stdout stays {}"
 # ---------------------------------------------------------------------------
 cwd=$(tf_failing_sandbox warn-mode)
 stub_dir=$(mktemp -d)
-mk_stub "$stub_dir" terraform 'if [[ "$*" == *"-check"* ]]; then echo "main.tf drift"; exit 3; fi' 'exit 0'
-run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then echo "main.tf drift"; exit 3; fi' 'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MODE=warn
 assert_noop
 printf '%s' "$HOOK_STDERR" | grep -q 'terraform fmt reported drift' \
   && ok "stderr carries the finding" || bad "warn stderr" "stderr='$HOOK_STDERR'"
 [[ -z "$(find "$SANDBOX_ROOT" -name '*.log' -type f)" ]] && ok "no log file written anywhere" \
   || bad "log files" "$(find "$SANDBOX_ROOT" -name '*.log' -type f)"
+# Failing and unchanged: warn has nothing new to say, so the next stop is idle.
+rm -f "$(calls_of "$cwd")"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MODE=warn LINT_ENFORCER_DEBUG=true
+[[ ! -f "$(calls_of "$cwd")" ]] && ok "unchanged failing workspace is idle in warn mode" \
+  || bad "warn re-ran" "stderr='$HOOK_STDERR'"
 rm -rf "$stub_dir"
 
 # ---------------------------------------------------------------------------
@@ -438,22 +455,143 @@ hdr "Block mode: executionNum loop guard (LINT_ENFORCER_MAX_CONTINUES)"
 # ---------------------------------------------------------------------------
 cwd=$(tf_failing_sandbox block-loop)
 stub_dir=$(mktemp -d)
-mk_stub "$stub_dir" terraform 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
-# executionNum 2 of max 2 → still continues.
-RUN_EXEC=2 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform \
-  LINT_ENFORCER_MODE=block LINT_ENFORCER_MAX_CONTINUES=2
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
+# The agent is sent back without editing anything in between: a failing
+# verdict must be re-enforced, not forgotten after the first continue.
+RUN_EXEC=1 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MAX_CONTINUES=2
 assert_continue
+rm -f "$(calls_of "$cwd")"
+RUN_EXEC=2 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MAX_CONTINUES=2 LINT_ENFORCER_DEBUG=true
+assert_continue
+[[ -f "$(calls_of "$cwd")" ]] && ok "unchanged failing workspace is re-linted while enforcing" \
+  || bad "re-enforce" "stderr='$HOOK_STDERR'"
 printf '%s' "$HOOK_STDOUT" | jq -r '.reason' | grep -q 'forced continue 2 of 2' \
   && ok "reason reports the continue budget" || bad "budget text" "stdout='$HOOK_STDOUT'"
-# executionNum 3 of max 2 → budget exhausted → let the agent stop. Touch the
-# file so L3 does not hide the pass (the agent "edited" between stops).
-sleep 1; echo '# edit' >> "$cwd/main.tf"
-RUN_EXEC=3 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform \
-  LINT_ENFORCER_MODE=block LINT_ENFORCER_MAX_CONTINUES=2 LINT_ENFORCER_DEBUG=true
+# executionNum 3 of max 2 → budget exhausted → let the agent stop, and do not
+# even spend a linter run on it: nothing changed and nothing can be enforced.
+rm -f "$(calls_of "$cwd")"
+RUN_EXEC=3 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MAX_CONTINUES=2 LINT_ENFORCER_DEBUG=true
 [[ "$HOOK_STDOUT" == "{}" ]] && ok "executionNum beyond budget → {}" \
   || bad "loop guard" "stdout='$HOOK_STDOUT'"
 printf '%s' "$HOOK_STDERR" | grep -q 'max continues' && ok "trace explains the guard" \
   || bad "loop guard trace" "stderr='$HOOK_STDERR'"
+[[ ! -f "$(calls_of "$cwd")" ]] && ok "no linter run spent on an unenforceable, unchanged stop" \
+  || bad "wasted run" "$(cat "$(calls_of "$cwd")")"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Block mode: a failure found on an unenforceable stop is enforced on the next normal one"
+# ---------------------------------------------------------------------------
+# e.g. the agent asked the user a question (TERMINAL_STEP_TYPE) with lint
+# errors outstanding, then finished the next turn without touching the file.
+cwd=$(tf_failing_sandbox block-deferred)
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
+RUN_TERM=TERMINAL_STEP_TYPE run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+assert_noop
+rm -f "$(calls_of "$cwd")"
+RUN_TERM=NO_TOOL_CALL run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+assert_continue
+[[ -f "$(calls_of "$cwd")" ]] && ok "linters re-ran on the first enforceable stop" \
+  || bad "deferred enforcement" "stderr='$HOOK_STDERR'"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "No-git: a failing verdict is re-enforced without edits, a clean one is idle"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox nogit-failing)
+echo 'resource "x" "y" {}' > "$cwd/main.tf"
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+assert_continue
+rm -f "$(calls_of "$cwd")"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+assert_continue
+[[ -f "$(calls_of "$cwd")" ]] && ok "no-git failing workspace re-linted while enforcing" \
+  || bad "no-git re-enforce" "stderr='$HOOK_STDERR'"
+mk_stub "$stub_dir" terraform "$RECORD" 'exit 0'     # now passes
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+assert_noop
+rm -f "$(calls_of "$cwd")"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+[[ ! -f "$(calls_of "$cwd")" ]] && ok "no-git clean workspace is idle on the next stop" \
+  || bad "no-git idle" "stderr='$HOOK_STDERR'"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Python: uv present but ruff unavailable → skip, never a failure"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox no-ruff)
+printf '[project]\nname="x"\nversion="0"\n' > "$cwd/pyproject.toml"
+git_sandbox "$cwd" "echo 'x=1' > mod.py"
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" uv "$RECORD" 'echo "error: Failed to spawn: \`ruff\`" >&2' 'exit 2'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv
+assert_noop
+printf '%s' "$HOOK_STDERR" | grep -q 'ruff not available' && ok "skip is explained on stderr" \
+  || bad "ruff skip note" "stderr='$HOOK_STDERR'"
+grep -q -- '--version' "$(calls_of "$cwd")" && ok "ruff was probed once" || bad "probe" "$(cat "$(calls_of "$cwd")")"
+grep -q -- 'format' "$(calls_of "$cwd")" && bad "format ran without ruff" "$(cat "$(calls_of "$cwd")")" \
+  || ok "no format/check attempted without ruff"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Monorepo: a workspace that is a sub-directory of the repo sees only its own changes"
+# ---------------------------------------------------------------------------
+repo=$(mk_sandbox monorepo)
+mkdir -p "$repo/svc-a" "$repo/svc-b"
+# Each sub-directory workspace gets its own state/calls dirs (keyed by basename).
+mkdir -p "$SANDBOX_ROOT/svc-a.state" "$SANDBOX_ROOT/svc-a.calls" "$SANDBOX_ROOT/svc-b.state" "$SANDBOX_ROOT/svc-b.calls"
+echo 'resource "a" "a" {}' > "$repo/svc-a/main.tf"
+echo 'resource "b" "b" {}' > "$repo/svc-b/main.tf"
+git_sandbox "$repo" "echo 'resource \"b\" \"c\" {}' >> svc-b/main.tf"   # only B is dirty
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'exit 0'
+# Workspace A: nothing of its own changed → nothing runs.
+run_hook "$repo/svc-a" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+assert_noop
+[[ ! -f "$(calls_of "$repo/svc-a")" ]] && ok "sibling's dirty file does not trigger workspace A" \
+  || bad "monorepo leak" "$(cat "$(calls_of "$repo/svc-a")")"
+# Workspace B: runs, then a content-only edit is detected via the relative path.
+run_hook "$repo/svc-b" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+[[ -f "$(calls_of "$repo/svc-b")" ]] && ok "workspace B linted its own change" || bad "workspace B" "stderr='$HOOK_STDERR'"
+rm -f "$(calls_of "$repo/svc-b")"
+sleep 1; echo '# edit' >> "$repo/svc-b/main.tf"
+run_hook "$repo/svc-b" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+[[ -f "$(calls_of "$repo/svc-b")" ]] && ok "content edit in a sub-directory workspace is detected" \
+  || bad "subdir mtime check" "stderr='$HOOK_STDERR'"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "L1: terraform kept in a sub-directory is detected"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox tf-subdir)
+mkdir -p "$cwd/infra/prod"
+echo 'resource "x" "y" {}' > "$cwd/infra/prod/main.tf"
+git_sandbox "$cwd" "echo 'resource \"x\" \"z\" {}' >> infra/prod/main.tf"
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+[[ -f "$(calls_of "$cwd")" ]] && ok "terraform invoked for infra/prod/*.tf" || bad "tf subdir" "stderr='$HOOK_STDERR'"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Paths with spaces in STATE_DIR survive the no-git find gate (no eval)"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox "spaced")
+echo 'resource "x" "y" {}' > "$cwd/main.tf"
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'exit 0'
+spaced_state="$SANDBOX_ROOT/state dir with spaces/and (parens)"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_STATE_DIR="$spaced_state"
+[[ -f "$(calls_of "$cwd")" ]] && ok "first run linted" || bad "first run" "stderr='$HOOK_STDERR'"
+rm -f "$(calls_of "$cwd")"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_STATE_DIR="$spaced_state" LINT_ENFORCER_DEBUG=true
+[[ ! -f "$(calls_of "$cwd")" ]] && ok "idle skip works with a spaced state path" \
+  || bad "spaced state" "stderr='$HOOK_STDERR'"
+printf '%s' "$HOOK_STDERR" | grep -qi 'syntax error\|No such file' && bad "shell error" "stderr='$HOOK_STDERR'" \
+  || ok "no shell errors"
 rm -rf "$stub_dir"
 
 # ---------------------------------------------------------------------------

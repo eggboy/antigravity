@@ -175,6 +175,8 @@ All 36 runs passed, so the numbers below compare efficiency. Each row sums the p
 
 How to read the table:
 
+> [!WARNING] The pricing shown below is for illustrative purposes only. As you can imagine, actual pricing is significantly more complex.
+
 - Turns drive tokens. `agy` resends the whole conversation on each turn: a 22k-token system prompt, 15 tool schemas and the history so far. A task that takes 40 turns costs several times a task that takes 10. Qwen needed 66 turns for the four tasks, Argon 25 to 59, Flash 104 to 181.
 - Most of those tokens hit a cache. Gemini bills cached input at 5 to 10% of the input price. vLLM's prefix cache served 95% of Qwen's prompt tokens from GPU memory, so the GPU recomputed about 5% of them.
 - The two cost columns measure different things. Gemini cost is list price times tokens. Qwen cost is the seconds the Cloud Run instance spent on the task times $3.56 per hour (RTX PRO 6000, 20 vCPU, 80 GiB, asia-southeast1 list price). Cloud Run bills idle seconds at the same rate; the two-hour benchmark session cost about $7.50.

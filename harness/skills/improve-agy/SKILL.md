@@ -65,8 +65,10 @@ friction: habit → rule → hook → skill → automation.
    alternative is the in-agent fan-out
    `run_workflow(ScriptPath=<skill-dir>/scripts/label_workflow.py, Args={"packets_dir": "$S/packets", "cards_dir": "$S/cards", "model": "flash"})`
    followed by the same `ingest` and `report`.
-4. **Read `digest.md`** (≈300 lines). Sections 2–6 are deterministic evidence (friction signals, evidence by cause
-   with example sessions, correction excerpts, highest-friction sessions, context and cost pressure). Section 7 tells
+4. **Read `digest.md`** (≈330 lines). Sections 2–6 are deterministic evidence (friction signals, evidence by cause
+   with example sessions — including the dev loop: edits followed by failing tests/builds and the sessions stuck in
+   fix attempts —, correction excerpts, highest-friction sessions, context and cost pressure: pasted logs, late
+   context growth, read/edit churn, slow turns). Section 7 tells
    you where rules belong (workspaces, tools, slash commands in use). Section 8 is the judged evidence: blockers by
    type with side (agent / user / environment), standing instructions you keep giving (support = distinct sessions),
    and fix candidates grouped by the blocker type they address. Sections 9–10 show deltas since the last run and the

@@ -53,10 +53,22 @@ the trend in digest section 9 over absolute values.
 | Compaction | `CHECKPOINT` step ("Resuming from a compaction") | ≥ 1 per session on average, or any session with ≥ 3 | Oversized tool outputs → `head`/`tail`/`grep`, scratch files, research subagents, `/compact` at milestones |
 | API error | `ERROR_MESSAGE` with an error (`RESOURCE_EXHAUSTED (code 429)`, `UNAVAILABLE`, stream timeouts) | Clustered in specific sessions or during fan-out | Quota pressure → fewer parallel subagents, lighter models for research, retry later |
 | Unfinished session | Last step is a user turn, a `RUNNING` tool, an `ask_question`, or a tool error | > 25% of sessions | Abandoned runs → `/goal` for long tasks, `Stop` hook while tests run; cancelled runs → read why |
+| Edit→fail cycle (dev loop) | One or more edits (`edit_file`, `write_file`, …) followed, before the next user turn, by a failing verification command (`go test`, `pytest`, `ruff`, `mvn`, `make test`, `npm run build`, `terraform validate`, …; see `CHECK_KEYS` / `is_check_command`). Checks the sandbox refused to run are ignored. `max_fix_attempts` = longest run of consecutive failing checks with edits in between; `ended_red` = the session's last executed check failed | > 8 cycles per 100 edits; any session with ≥ 3 consecutive failing fixes | Guess-and-check loop → rule: read the failing assertion or compiler line before the next edit; workspace rule with the exact test command; after two red runs, stop and report |
+| Pasted-log user turn | User turn longer than 4,000 characters | > 5% of user turns, or in the heaviest sessions | Attach a file or a scratch path instead of pasting; rule to summarize logs with `grep`/`tail` first |
+| Late context growth | Median context (input + cache-read tokens per agent turn) of the last quarter of turns ÷ first quarter, sessions ≥ 20 turns and peak context ≥ 200k tokens | ratio ≥ 3 | Long tool outputs accumulating → `head`/`tail`/scratch files, research subagents, `/compact` at milestones, split the task |
+| Read / edit churn | Same file read ≥ 3× or edited ≥ 4× in one session | Any file in ≥ 2 sessions | Read with line ranges once and keep notes in scratch; for edit churn, plan the change before editing or use one larger edit |
+| Slow turns | Agent turn time = seconds from a planner step to the tool step that follows it (thinking + generation; tool execution, waits for system messages and user turns excluded) | p90 ≥ 120 s in a session | Heavy effort tier on mechanical work → lighter model or lower effort for bulk edits/searches |
 
 Rates reported: corrections per 100 user messages, rapid re-prompts % of user messages, failed commands % of
 commands, tool errors and retries per 100 calls, sandbox blocks / polls / compactions per session, unfinished
-sessions %. All of them are tracked in the snapshot deltas (section 9); snapshots are only written by unfiltered runs.
+sessions %, edit→fail cycles per 100 edits, pasted-log turns % of user messages, p90 turn seconds, late-growth
+session count. All of them are tracked in the snapshot deltas (section 9); snapshots are only written by unfiltered
+runs.
+
+Section 3 opens with the dev-loop line (edits, verification runs, failures, cycles, sessions that ended red), the
+failing verification commands with example sessions, and the sessions that needed ≥ 3 consecutive fix attempts.
+Section 6 ends with the pressure signals: pasted-log turns, peak context, turn latency, late-growth sessions, read
+and edit churn by file, slow sessions.
 
 Every table in section 3 lists up to three example sessions per cause; quote them in the Evidence field and use
 `session <id>` only when the cause is still unclear.
@@ -70,7 +82,7 @@ judgement.
 
 ## Friction score and deep-dive candidates (section 5)
 
-`friction_score = 3·corrections + 2·retries + failed_commands + tool_errors + sandbox_blocks + compactions + rapid_followups`.
+`friction_score = 3·corrections + 2·retries + failed_commands + tool_errors + sandbox_blocks + compactions + rapid_followups + edit_fail_cycles`.
 It only ranks sessions for deep dives (`session <id>`); never present it as a quality grade. The breakdown column
 tells you which signal dominates before you open the session.
 

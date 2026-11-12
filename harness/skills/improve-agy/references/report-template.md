@@ -52,6 +52,8 @@ delivered without corrections). Keep it factual; it tells the reader what not to
 | Tool errors | | | > 2 per 100 calls | |
 | Sandbox / permission blocks | | | same target in ≥ 3 sessions | |
 | Context compactions | | | ≥ 1 per session | |
+| Edit→fail cycles | | | > 8 per 100 edits; any session with ≥ 3 consecutive failing fixes | |
+| Late context growth / churn | | | ratio ≥ 3 with peak ≥ 200k; same file ≥ 3 reads or ≥ 4 edits | |
 | Rapid re-prompts | | | > 15% of user turns | |
 | Polling calls | | | > 5 per session | |
 | API errors | | | clustered | |

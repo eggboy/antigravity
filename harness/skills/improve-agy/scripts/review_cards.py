@@ -47,6 +47,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR / "card.schema.json"
 PROMPT_PATH = SCRIPT_DIR.parent / "references" / "review-card-prompt.md"
 CARDS_DIR = core.STATE_DIR / "cards"
+READ_CHURN = core.READ_CHURN_MIN
+EDIT_CHURN = core.EDIT_CHURN_MIN
 
 TRIVIAL_MAX_USER_TURNS = 1  # sessions with <= 1 user turn ...
 TRIVIAL_MAX_ACTIVE_SECONDS = 180  # ... and under 3 active minutes are not labelled
@@ -202,10 +204,25 @@ def render_packet(s: core.Session) -> str:
     out.append(f"- identical consecutive calls: {s.retries} ({retry_desc})")
     out.append("")
     out.append("## Pressure")
+    dl = s.dev_loop()
+    pr = s.pressure()
     out.append(
         f"compactions {s.compactions} · API errors {len(s.api_errors)} · sandbox blocks {len(s.sandbox_blocked)} · "
         f"longest autonomous streak {s.max_streak} tool calls · polling calls {s.polls} · "
         f"tokens in/out {s.input_tokens:,}/{s.output_tokens:,}"
+    )
+    out.append(
+        f"dev loop: {dl['edits']} edits, {dl['checks_run']} verification runs ({dl['checks_failed']} failed), "
+        f"{dl['edit_fail_cycles']} edit→fail cycles, longest run of failing fixes {dl['max_fix_attempts']}"
+        f"{', ended with a red check' if dl['ended_red'] else ''}"
+    )
+    out.append(
+        f"context: pasted-log user turns {pr['large_user_messages']} · peak context "
+        f"{pr['peak_context_tokens']:,} tokens"
+        f" · late growth ×{pr['late_growth_ratio'] if pr['late_growth_ratio'] is not None else '-'}"
+        f" · files read ≥{READ_CHURN}× {len(pr['read_churn_files'])} · files edited ≥{EDIT_CHURN}× "
+        f"{len(pr['edit_churn_files'])} · turn latency median {pr['median_turn_seconds']}s "
+        f"p90 {pr['p90_turn_seconds']}s"
     )
     out.append("")
     out.append("## Ending")

@@ -61,6 +61,36 @@ EDIT_TOOLS = frozenset(
     {"edit_file", "write_file", "notebook_edit", "replace_file_content", "multi_replace_file_content"}
 )
 POLL_TOOLS = frozenset({"manage_task", "swarm_wait", "read_board"})
+READ_TOOLS = frozenset({"read_file", "view_file"})
+LARGE_USER_MESSAGE_CHARS = 4000  # a user turn longer than this is almost always a pasted log or document
+READ_CHURN_MIN = 3  # same file read this many times in one session
+EDIT_CHURN_MIN = 4  # same file edited this many times in one session
+LATE_GROWTH_MIN_PEAK = 200_000  # late growth only matters once the context is actually large
+CHECK_KEYS = frozenset(
+    {
+        "pytest", "ruff", "ruff check", "ruff format", "mypy", "pyright", "tsc", "eslint", "shellcheck",
+        "golangci-lint",
+        "go test", "go build", "go vet", "make test", "make lint", "make build", "make check", "make verify", "make",
+        "npm test", "pnpm test", "yarn test", "cargo test", "cargo build", "cargo check", "cargo clippy",
+        "mvn", "mvnw", "gradle", "gradlew", "bazel test", "bazel build", "blaze test", "blaze build",
+        "terraform validate", "terraform plan", "claat export",
+    }
+)  # fmt: skip
+CHECK_WORDS_RE = re.compile(
+    r"\b(test|tests|lint|vet|build|compile|typecheck|type-check|validate|verify|check|package)\b"
+)
+
+
+def is_check_command(command: str, key: str) -> bool:
+    """Heuristic for 'verification' commands whose failure after an edit marks a dev-loop cycle."""
+    if key in CHECK_KEYS:
+        return True
+    head = key.split(" ")[0]
+    if head in {"make", "go", "cargo", "npm", "pnpm", "yarn", "bazel", "blaze", "tsc", "ruff"}:
+        return bool(CHECK_WORDS_RE.search(command))
+    return head in {"python3", "python", "uv"} and bool(re.search(r"\b(pytest|unittest)\b", command))
+
+
 SUBCOMMAND_BINARIES = frozenset(
     {
         "git", "make", "go", "kubectl", "gcloud", "gsutil", "bq", "npm", "pnpm", "yarn", "uv", "pip", "pip3", "python",
@@ -212,11 +242,96 @@ class Session:
     last_step_status: str = ""
     last_tool: str = ""
     final_reply: str = ""
+    turn_contexts: list[int] = field(default_factory=list)  # input + cache-read tokens per agent turn
+    turn_latencies: list[float] = field(default_factory=list)  # seconds from the previous step to each agent turn
 
     @property
     def short_id(self) -> str:
         """First eight characters of the conversation id, used in tables."""
         return self.conv_id[:8]
+
+    # ---- dev-loop analysis ------------------------------------------------------------------------------------------
+    def dev_loop(self) -> dict[str, Any]:
+        """Edit→check cycles: how often a verification command failed right after the agent edited files.
+
+        A cycle = one or more edits followed by a failing check command (test, build, lint, validate) before the
+        next user turn. ``max_fix_attempts`` is the longest run of consecutive failing checks with edits in between,
+        i.e. how many tries it took to get green (or how many were spent without getting there).
+        """
+        edits_since_check = 0
+        cycles = 0
+        failing_streak = 0
+        max_attempts = 0
+        checks_run = checks_failed = 0
+        ended_red = False
+        failing_checks: Counter[str] = Counter()
+        result_for_call = {id(r.call): r for r in self.tool_results if r.call is not None}
+        user_steps = sorted(m.step for m in self.user_messages)
+        next_user = 0
+        for call in self.tool_calls:
+            while next_user < len(user_steps) and user_steps[next_user] < call.step:
+                next_user += 1  # a user turn in between breaks the edit→check causal chain
+                edits_since_check = 0
+                failing_streak = 0
+            if call.name in EDIT_TOOLS:
+                edits_since_check += 1
+                continue
+            if not call.command or not is_check_command(call.command, call.command_key or ""):
+                continue
+            result = result_for_call.get(id(call))
+            if result is None or result.exit_code is None or result.sandbox_block:
+                continue  # a check the sandbox refused to run says nothing about the code
+            checks_run += 1
+            if result.exit_code != 0:
+                checks_failed += 1
+                if edits_since_check:
+                    failing_checks[call.command_key or "?"] += 1
+                    cycles += 1
+                    failing_streak += 1
+                    max_attempts = max(max_attempts, failing_streak)
+                ended_red = True
+            else:
+                failing_streak = 0
+                ended_red = False
+            edits_since_check = 0
+        edits = sum(1 for c in self.tool_calls if c.name in EDIT_TOOLS)
+        return {
+            "edits": edits,
+            "checks_run": checks_run,
+            "checks_failed": checks_failed,
+            "edit_fail_cycles": cycles,
+            "max_fix_attempts": max_attempts,
+            "ended_red": ended_red and checks_run > 0,
+            "failing_checks": dict(failing_checks.most_common(5)),
+        }
+
+    # ---- context and cost pressure ----------------------------------------------------------------------------------
+    def pressure(self) -> dict[str, Any]:
+        """Deterministic context/cost signals: pasted-log turns, late context growth, read/edit churn, slow turns."""
+        large = [len(m.text) for m in self.user_messages if len(m.text) > LARGE_USER_MESSAGE_CHARS]
+        contexts = self.turn_contexts
+        growth = None
+        if len(contexts) >= 20:
+            quarter = max(1, len(contexts) // 4)
+            early = statistics.median(contexts[:quarter])
+            late = statistics.median(contexts[-quarter:])
+            growth = round(late / early, 1) if early else None
+        reads: Counter[str] = Counter(p for c in self.tool_calls if c.name in READ_TOOLS for p in c.paths)
+        edits: Counter[str] = Counter(p for c in self.tool_calls if c.name in EDIT_TOOLS for p in c.paths)
+        churned_reads = {p: n for p, n in reads.items() if n >= READ_CHURN_MIN}
+        churned_edits = {p: n for p, n in edits.items() if n >= EDIT_CHURN_MIN}
+        latencies = sorted(self.turn_latencies)
+        p90 = latencies[int(len(latencies) * 0.9) - 1] if len(latencies) >= 10 else None
+        return {
+            "large_user_messages": len(large),
+            "largest_user_message_chars": max(large, default=0),
+            "peak_context_tokens": max(contexts, default=0),
+            "late_growth_ratio": growth,
+            "read_churn_files": churned_reads,
+            "edit_churn_files": churned_edits,
+            "median_turn_seconds": round(statistics.median(latencies), 1) if latencies else None,
+            "p90_turn_seconds": round(p90, 1) if p90 is not None else None,
+        }
 
     @property
     def title(self) -> str:
@@ -287,6 +402,7 @@ class Session:
             + len(self.sandbox_blocked)
             + self.compactions
             + self.rapid_followups
+            + self.dev_loop()["edit_fail_cycles"]
         )
 
     @property
@@ -504,6 +620,7 @@ def parse_session(transcript: Path, brain_label: str) -> Session:
     session = Session(conv_id=transcript.parents[2].name, brain=brain_label, path=transcript)
     pending: deque[ToolCall] = deque()
     prev_ts: datetime | None = None
+    prev_kind = ""
     last_model_ts: datetime | None = None
     streak = 0
     prev_signature: str | None = None
@@ -521,11 +638,16 @@ def parse_session(transcript: Path, brain_label: str) -> Session:
             session.steps += 1
             session.started = session.started or ts
             session.ended = ts
-            if prev_ts is not None:
-                gap = (ts - prev_ts).total_seconds()
-                if 0 <= gap <= IDLE_GAP_SECONDS:
-                    session.active_seconds += gap
+            step_gap = (ts - prev_ts).total_seconds() if prev_ts is not None else None
+            if step_gap is not None and 0 <= step_gap <= IDLE_GAP_SECONDS:
+                session.active_seconds += step_gap
+                # A planner step is stamped when generation starts, so the gap to the tool step that follows is the
+                # model's thinking + generation time (tool execution is the gap after that step; waits for system
+                # messages and user turns are not model time).
+                if prev_kind == "PLANNER_RESPONSE" and kind == "GENERIC":
+                    session.turn_latencies.append(step_gap)
             prev_ts = ts
+            prev_kind = kind
             is_wakeup = kind == "USER_INPUT" and "<USER_REQUEST>" not in content and "<SYSTEM_MESSAGE>" in content
             if is_wakeup:
                 kind = "SYSTEM_MESSAGE"  # a system message delivered through a user step: treat it as one
@@ -549,9 +671,13 @@ def parse_session(transcript: Path, brain_label: str) -> Session:
                 pending.clear()
             elif kind == "PLANNER_RESPONSE":
                 session.agent_turns += 1
-                session.input_tokens += int(row.get("input_tokens") or 0)
+                turn_input = int(row.get("input_tokens") or 0)
+                turn_cache = int(row.get("cache_read_tokens") or 0)
+                session.input_tokens += turn_input
                 session.output_tokens += int(row.get("output_tokens") or 0)
-                session.cache_read_tokens += int(row.get("cache_read_tokens") or 0)
+                session.cache_read_tokens += turn_cache
+                if turn_input or turn_cache:
+                    session.turn_contexts.append(turn_input + turn_cache)
                 last_model_ts = ts
                 if content:
                     session.final_reply = content
@@ -728,10 +854,24 @@ def aggregate(sessions: list[Session]) -> dict[str, Any]:
     slash: Counter[str] = Counter()
     skills: Counter[str] = Counter()
     errors, failed_cmds, sandbox_targets, repeated, retried = (Evidence() for _ in range(5))
+    failing_checks, read_churn, edit_churn = (Evidence() for _ in range(3))
     api_codes: Counter[str] = Counter()
     days: set[str] = set()
+    dev_loops: dict[str, dict[str, Any]] = {}
+    pressures: dict[str, dict[str, Any]] = {}
+    all_latencies: list[float] = []
     for s in users:
         days.add(_local_date(s.started or s.ended or datetime.now(UTC), tz))
+        dev_loops[s.conv_id] = s.dev_loop()
+        pressures[s.conv_id] = s.pressure()
+        all_latencies.extend(s.turn_latencies)
+        for key, n in dev_loops[s.conv_id]["failing_checks"].items():
+            for _ in range(n):
+                failing_checks.add(key, s)
+        for path in pressures[s.conv_id]["read_churn_files"]:
+            read_churn.add(_tilde(path), s)
+        for path in pressures[s.conv_id]["edit_churn_files"]:
+            edit_churn.add(_tilde(path), s)
         for m in s.user_messages:
             slash.update(m.slash_commands)
             skills.update(m.skills)
@@ -778,6 +918,62 @@ def aggregate(sessions: list[Session]) -> dict[str, Any]:
         "compactions": sum(s.compactions for s in users),
         "api_errors": sum(len(s.api_errors) for s in users),
         "unfinished_sessions": sum(1 for s in users if s.outcome != "completed turn"),
+        "edit_fail_cycles": sum(d["edit_fail_cycles"] for d in dev_loops.values()),
+        "large_user_messages": sum(p["large_user_messages"] for p in pressures.values()),
+    }
+    total_edits = sum(d["edits"] for d in dev_loops.values())
+    sorted_latencies = sorted(all_latencies)
+    p90_turn = sorted_latencies[int(len(sorted_latencies) * 0.9) - 1] if len(sorted_latencies) >= 10 else None
+    stuck = sorted(
+        (s for s in users if dev_loops[s.conv_id]["max_fix_attempts"] >= 3),
+        key=lambda s: -dev_loops[s.conv_id]["max_fix_attempts"],
+    )
+    late_growth = sorted(
+        (
+            s
+            for s in users
+            if (pressures[s.conv_id]["late_growth_ratio"] or 0) >= 3
+            and pressures[s.conv_id]["peak_context_tokens"] >= LATE_GROWTH_MIN_PEAK
+        ),
+        key=lambda s: -(pressures[s.conv_id]["late_growth_ratio"] or 0),
+    )
+    slow = sorted(
+        (s for s in users if (pressures[s.conv_id]["p90_turn_seconds"] or 0) >= 120),
+        key=lambda s: -(pressures[s.conv_id]["p90_turn_seconds"] or 0),
+    )
+    dev_loop_summary = {
+        "edits": total_edits,
+        "checks_run": sum(d["checks_run"] for d in dev_loops.values()),
+        "checks_failed": sum(d["checks_failed"] for d in dev_loops.values()),
+        "edit_fail_cycles": friction_totals["edit_fail_cycles"],
+        "sessions_ended_red": sum(1 for d in dev_loops.values() if d["ended_red"]),
+        "stuck_sessions": [
+            {"conv_id": s.short_id, "attempts": dev_loops[s.conv_id]["max_fix_attempts"], "title": _redact(s.title)}
+            for s in stuck[:8]
+        ],
+        "failing_checks": failing_checks.top(10),
+    }
+    pressure_summary = {
+        "large_user_messages": friction_totals["large_user_messages"],
+        "largest_user_message_chars": max((p["largest_user_message_chars"] for p in pressures.values()), default=0),
+        "peak_context_tokens": max((p["peak_context_tokens"] for p in pressures.values()), default=0),
+        "late_growth_sessions": [
+            {
+                "conv_id": s.short_id,
+                "ratio": pressures[s.conv_id]["late_growth_ratio"],
+                "peak_context": pressures[s.conv_id]["peak_context_tokens"],
+                "compactions": s.compactions,
+            }
+            for s in late_growth[:8]
+        ],
+        "read_churn": read_churn.top(8),
+        "edit_churn": edit_churn.top(8),
+        "median_turn_seconds": round(statistics.median(sorted_latencies), 1) if sorted_latencies else None,
+        "p90_turn_seconds": round(p90_turn, 1) if p90_turn is not None else None,
+        "slow_sessions": [
+            {"conv_id": s.short_id, "p90": pressures[s.conv_id]["p90_turn_seconds"], "turns": s.agent_turns}
+            for s in slow[:8]
+        ],
     }
     ordered_days = sorted(days)
     return {
@@ -819,7 +1015,13 @@ def aggregate(sessions: list[Session]) -> dict[str, Any]:
             "polls_per_session": _rate(friction_totals["polls"], len(users), 1, 2),
             "compactions_per_session": _rate(friction_totals["compactions"], len(users), 1, 2),
             "unfinished_sessions_pct": _rate(friction_totals["unfinished_sessions"], len(users), 100),
+            "edit_fail_cycles_per_100_edits": _rate(friction_totals["edit_fail_cycles"], total_edits, 100),
+            "large_user_messages_pct": _rate(friction_totals["large_user_messages"], total_user_msgs, 100),
+            "p90_turn_seconds": pressure_summary["p90_turn_seconds"] or 0.0,
+            "late_growth_sessions": len(late_growth),
         },
+        "dev_loop": dev_loop_summary,
+        "pressure": pressure_summary,
         "by_workspace": {w: dict(c) for w, c in sorted(by_workspace.items(), key=lambda kv: -kv[1]["friction"])},
         "tools": dict(tools.most_common(20)),
         "commands": dict(commands.most_common(25)),
@@ -873,6 +1075,8 @@ def session_record(s: Session) -> dict[str, Any]:
         },
         "repeated_failures": dict(s.repeated_failures),
         "max_autonomous_streak": s.max_streak,
+        "dev_loop": s.dev_loop(),
+        "pressure": {k: v for k, v in s.pressure().items() if not k.endswith("_files")},
         "outcome": s.outcome,
     }
 
@@ -986,13 +1190,39 @@ def render_digest(
                     fr["unfinished_sessions"],
                     f"{rates['unfinished_sessions_pct']}%",
                 ],
+                [
+                    "Edit→fail cycles (edits followed by a failing test/build/lint)",
+                    fr["edit_fail_cycles"],
+                    f"{rates['edit_fail_cycles_per_100_edits']} per 100 edits",
+                ],
+                [
+                    f"Pasted-log user turns (> {LARGE_USER_MESSAGE_CHARS:,} chars)",
+                    fr["large_user_messages"],
+                    f"{rates['large_user_messages_pct']}% of user msgs",
+                ],
             ],
         )
     )
 
     out.append(heading("Evidence by cause"))
+    dl = summary["dev_loop"]
     out.append(
-        "Tool errors (normalized):\n\n"
+        f"Dev loop: {dl['edits']} edits, {dl['checks_run']} verification runs, {dl['checks_failed']} failed, "
+        f"{dl['edit_fail_cycles']} edit→fail cycles, {dl['sessions_ended_red']} sessions ended with a red check.\n"
+    )
+    out.append(
+        "\nFailing verification commands after edits:\n\n"
+        + _table(["Check", "Failures", "Example sessions"], _evidence_rows(dl["failing_checks"]))
+    )
+    out.append(
+        "\nSessions that needed ≥ 3 consecutive fix attempts:\n\n"
+        + _table(
+            ["Session", "Attempts", "Title"],
+            [[f"`{x['conv_id']}`", x["attempts"], x["title"]] for x in dl["stuck_sessions"]],
+        )
+    )
+    out.append(
+        "\nTool errors (normalized):\n\n"
         + _table(["Error", "Count", "Example sessions"], _evidence_rows(summary["top_errors"]))
     )
     out.append(
@@ -1078,6 +1308,37 @@ def render_digest(
                 ]
                 for s in heavy
             ],
+        )
+    )
+    pr = summary["pressure"]
+    out.append(
+        f"\nPressure signals: {pr['large_user_messages']} pasted-log user turns (largest "
+        f"{_fmt_int(pr['largest_user_message_chars'])} chars) · peak context "
+        f"{_fmt_int(pr['peak_context_tokens'])} tokens · agent turn latency median "
+        f"{pr['median_turn_seconds']}s, p90 {pr['p90_turn_seconds']}s.\n"
+    )
+    growth_rows = [
+        [f"`{x['conv_id']}`", x["ratio"], _fmt_int(x["peak_context"]), x["compactions"]]
+        for x in pr["late_growth_sessions"]
+    ]
+    out.append(
+        "\nLate context growth (median context of the last quarter of turns ÷ first quarter, "
+        f"sessions ≥ 20 turns and peak context ≥ {_fmt_int(LATE_GROWTH_MIN_PEAK)} tokens):\n\n"
+        + _table(["Session", "Growth ×", "Peak context", "Compactions"], growth_rows)
+    )  # fmt: skip
+    out.append(
+        f"\nRead churn (same file read ≥ {READ_CHURN_MIN}× in one session):\n\n"
+        + _table(["File", "Sessions", "Example sessions"], _evidence_rows(pr["read_churn"]))
+    )
+    out.append(
+        f"\nEdit churn (same file edited ≥ {EDIT_CHURN_MIN}× in one session):\n\n"
+        + _table(["File", "Sessions", "Example sessions"], _evidence_rows(pr["edit_churn"]))
+    )
+    out.append(
+        "\nSlow sessions (p90 agent-turn latency ≥ 120 s):\n\n"
+        + _table(
+            ["Session", "p90 seconds", "Agent turns"],
+            [[f"`{x['conv_id']}`", x["p90"], x["turns"]] for x in pr["slow_sessions"]],
         )
     )
 
@@ -1204,6 +1465,10 @@ TRACKED_METRICS = {
     "polls_per_session": ("friction_rates", "polls_per_session"),
     "compactions_per_session": ("friction_rates", "compactions_per_session"),
     "unfinished_sessions_pct": ("friction_rates", "unfinished_sessions_pct"),
+    "edit_fail_cycles_per_100_edits": ("friction_rates", "edit_fail_cycles_per_100_edits"),
+    "large_user_messages_pct": ("friction_rates", "large_user_messages_pct"),
+    "p90_turn_seconds": ("friction_rates", "p90_turn_seconds"),
+    "late_growth_sessions": ("friction_rates", "late_growth_sessions"),
 }
 
 
@@ -1351,7 +1616,10 @@ def main(argv: list[str] | None = None) -> int:
     (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
     (args.out_dir / "digest.md").write_text(digest, encoding="utf-8")
     text = json.dumps(summary, indent=2, default=str) if args.json else digest
-    sys.stdout.write(text + f"\n\n_written: {args.out_dir / 'digest.md'} and {args.out_dir / 'summary.json'}_\n")
+    footer = f"\n\n_written: {args.out_dir / 'digest.md'} and {args.out_dir / 'summary.json'}_\n"
+    sys.stdout.write(text + ("\n" if args.json else footer))
+    if args.json:
+        sys.stderr.write(footer)  # keep stdout pure JSON for jq / json.loads
     return 0
 
 

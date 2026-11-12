@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "improve-agy review card",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conv_id", "task", "outcome", "user_effort", "blockers", "standing_instructions", "fix_candidates", "worked_well", "confidence"],
+  "properties": {
+    "conv_id": {"type": "string", "minLength": 8},
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "summary"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["build", "fix", "investigate", "operate", "author", "configure", "learn", "chat"]},
+        "summary": {"type": "string", "maxLength": 160}
+      }
+    },
+    "outcome": {"type": "string", "enum": ["delivered", "partial", "abandoned", "unclear"]},
+    "user_effort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["corrections", "re_explanations", "cancellations"],
+      "properties": {
+        "corrections": {"type": "integer", "minimum": 0},
+        "re_explanations": {"type": "integer", "minimum": 0},
+        "cancellations": {"type": "integer", "minimum": 0}
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "step", "detail", "cost"],
+        "properties": {
+          "type": {"type": "string", "enum": ["unverified_path", "repeat_without_change", "scope_creep", "missed_standing_instruction", "thin_request", "environment_wall", "context_overflow", "output_mismatch", "external_fault"]},
+          "step": {"type": "integer", "minimum": 0},
+          "detail": {"type": "string", "maxLength": 200},
+          "cost": {"type": "string", "enum": ["low", "medium", "high"]}
+        }
+      }
+    },
+    "standing_instructions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "scope", "step"],
+        "properties": {
+          "text": {"type": "string", "maxLength": 200},
+          "scope": {"type": "string", "enum": ["global", "workspace"]},
+          "step": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "fix_candidates": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mechanism", "scope", "text", "blockers"],
+        "properties": {
+          "mechanism": {"type": "string", "enum": ["habit", "rule", "hook", "skill", "automation"]},
+          "scope": {"type": "string", "enum": ["global", "workspace"]},
+          "text": {"type": "string", "maxLength": 300},
+          "blockers": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+        }
+      }
+    },
+    "worked_well": {"type": "string", "maxLength": 160},
+    "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+  }
+}

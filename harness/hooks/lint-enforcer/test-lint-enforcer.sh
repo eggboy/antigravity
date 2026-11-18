@@ -455,12 +455,14 @@ hdr "Block mode: executionNum loop guard (LINT_ENFORCER_MAX_CONTINUES)"
 # ---------------------------------------------------------------------------
 cwd=$(tf_failing_sandbox block-loop)
 stub_dir=$(mktemp -d)
-mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
-# The agent is sent back without editing anything in between: a failing
-# verdict must be re-enforced, not forgotten after the first continue.
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then cat "$(dirname "$0")/msg"; exit 3; fi' 'exit 0'
+# Each continue surfaces a distinct finding so dedupe does not short-circuit
+# before MAX_CONTINUES is reached; main.tf itself is untouched between runs.
+echo 'err 1' > "$stub_dir/msg"
 RUN_EXEC=1 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MAX_CONTINUES=2
 assert_continue
 rm -f "$(calls_of "$cwd")"
+echo 'err 2' > "$stub_dir/msg"
 RUN_EXEC=2 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_MAX_CONTINUES=2 LINT_ENFORCER_DEBUG=true
 assert_continue
 [[ -f "$(calls_of "$cwd")" ]] && ok "unchanged failing workspace is re-linted while enforcing" \
@@ -502,10 +504,12 @@ hdr "No-git: a failing verdict is re-enforced without edits, a clean one is idle
 cwd=$(mk_sandbox nogit-failing)
 echo 'resource "x" "y" {}' > "$cwd/main.tf"
 stub_dir=$(mktemp -d)
-mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then exit 3; fi' 'exit 0'
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then cat "$(dirname "$0")/msg"; exit 3; fi' 'exit 0'
+echo 'err 1' > "$stub_dir/msg"
 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
 assert_continue
 rm -f "$(calls_of "$cwd")"
+echo 'err 2' > "$stub_dir/msg"
 run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
 assert_continue
 [[ -f "$(calls_of "$cwd")" ]] && ok "no-git failing workspace re-linted while enforcing" \
@@ -749,6 +753,359 @@ run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
 rm -rf "$stub_dir"
 assert_noop
 printf '%s' "$HOOK_STDOUT" | jq -e . >/dev/null 2>&1 && ok "stdout parses as JSON" || bad "json parse" "stdout='$HOOK_STDOUT'"
+
+# ---------------------------------------------------------------------------
+hdr "L0: LINT_ENFORCER_SKIP_DIRS skips listed dirs and subdirs, not prefix siblings"
+# ---------------------------------------------------------------------------
+fake_home="$SANDBOX_ROOT/skip-home"
+mkdir -p "$fake_home/skip-repo/sub" "$fake_home/skip-repo-two" \
+  "$SANDBOX_ROOT/skip-repo.state" "$SANDBOX_ROOT/skip-repo.calls" \
+  "$SANDBOX_ROOT/sub.state" "$SANDBOX_ROOT/sub.calls" \
+  "$SANDBOX_ROOT/skip-repo-two.state" "$SANDBOX_ROOT/skip-repo-two.calls"
+echo 'resource "x" "y" {}' > "$fake_home/skip-repo/main.tf"
+echo 'resource "x" "y" {}' > "$fake_home/skip-repo/sub/main.tf"
+echo 'resource "x" "y" {}' > "$fake_home/skip-repo-two/main.tf"
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'exit 0'
+# Leading ~, empty entries, and trailing slashes must all work on bash 3.2 set -u.
+skip_spec=":~/skip-repo/::/nonexistent/path/:"
+
+run_hook "$fake_home/skip-repo" env HOME="$fake_home" PATH="$stub_dir:$BASE_PATH" \
+  LINT_ENFORCER_SKIP_DIRS="$skip_spec" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_DEBUG=true
+assert_noop
+[[ ! -f "$(calls_of "$fake_home/skip-repo")" ]] && ok "listed dir skipped at L0 (no linter run)" \
+  || bad "skip-repo ran" "$(cat "$(calls_of "$fake_home/skip-repo")")"
+printf '%s' "$HOOK_STDERR" | grep -q 'matched LINT_ENFORCER_SKIP_DIRS' \
+  && ok "trace reports LINT_ENFORCER_SKIP_DIRS skip" || bad "skip trace" "stderr='$HOOK_STDERR'"
+printf '%s' "$HOOK_STDERR" | grep -q 'unbound variable' \
+  && bad "set -u crash on SKIP_DIRS" "stderr='$HOOK_STDERR'" || ok "bash 3.2 set -u safe with empty entries"
+
+run_hook "$fake_home/skip-repo/sub" env HOME="$fake_home" PATH="$stub_dir:$BASE_PATH" \
+  LINT_ENFORCER_SKIP_DIRS="$skip_spec" LINT_ENFORCER_LANGS=terraform
+assert_noop
+[[ ! -f "$(calls_of "$fake_home/skip-repo/sub")" ]] && ok "subdirectory below listed dir is skipped" \
+  || bad "subdir ran" "$(cat "$(calls_of "$fake_home/skip-repo/sub")")"
+
+run_hook "$fake_home/skip-repo-two" env HOME="$fake_home" PATH="$stub_dir:$BASE_PATH" \
+  LINT_ENFORCER_SKIP_DIRS="$skip_spec" LINT_ENFORCER_LANGS=terraform
+[[ -f "$(calls_of "$fake_home/skip-repo-two")" ]] && ok "name-prefix sibling is NOT skipped" \
+  || bad "sibling skipped" "stderr='$HOOK_STDERR'"
+
+# Multi-root: skipped workspace is bypassed while active sibling workspace is linted.
+rm -f "$(calls_of "$fake_home/skip-repo")" "$(calls_of "$fake_home/skip-repo-two")"
+run_hook "$fake_home/skip-repo:$fake_home/skip-repo-two" env HOME="$fake_home" PATH="$stub_dir:$BASE_PATH" \
+  LINT_ENFORCER_SKIP_DIRS="$skip_spec" LINT_ENFORCER_LANGS=terraform
+grep -q "in $fake_home/skip-repo$" "$(calls_of "$fake_home/skip-repo")" 2>/dev/null \
+  && bad "multi-root skip-repo ran" "$(cat "$(calls_of "$fake_home/skip-repo")")" \
+  || ok "multi-root: listed root skipped"
+grep -q "in $fake_home/skip-repo-two" "$(calls_of "$fake_home/skip-repo")" 2>/dev/null \
+  && ok "multi-root: unlisted sibling root still linted" \
+  || bad "multi-root sibling missed" "stderr='$HOOK_STDERR'"
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Diagnostics sanitization, warn stderr, and unchanged-findings deduplication"
+# ---------------------------------------------------------------------------
+cwd=$(tf_failing_sandbox dedupe-diag)
+stub_dir=$(mktemp -d)
+mk_stub "$stub_dir" terraform "$RECORD" 'if [[ "$*" == *"-check"* ]]; then cat "$(dirname "$0")/msg"; exit 3; fi' 'exit 0'
+# Quotes, tab, backslash, ANSI colour codes, and an invalid UTF-8 byte.
+printf 'main.tf\n-  a = "x"\t\\path\033[31m\033[0m \377\n' > "$stub_dir/msg"
+tf_env=(env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform)
+run_hook "$cwd" "${tf_env[@]}"
+assert_continue
+if printf '%s' "$HOOK_STDOUT" | jq -e '.decision == "continue"
+     and (.reason | contains("--- terraform fmt reported drift ---"))
+     and (.reason | contains("-  a = \"x\"\t\\path"))' >/dev/null 2>&1 \
+   && ! printf '%s' "$HOOK_STDOUT" | grep -q '\[31m' \
+   && printf '%s' "$HOOK_STDOUT" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  ok "JSON is valid UTF-8, ANSI stripped, and quotes/tab/backslash preserved"
+else
+  bad "sanitized diagnostics" "stdout='$HOOK_STDOUT'"
+fi
+
+# Warn mode and non-enforceable stops print diagnostics to stderr without recording
+# them as sent to the agent, so the next normal Stop still enforces.
+printf 'main.tf\n-  b = 2\n' > "$stub_dir/msg"
+rm -f "$(state_dir_of "$cwd")"/*.state
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_MODE=warn
+if [[ "$HOOK_STDOUT" == "{}" ]] && printf '%s' "$HOOK_STDERR" | grep -q -- '-  b = 2'; then
+  ok "warn mode prints diagnostics to stderr and answers {}"
+else
+  bad "warn diagnostics" "stdout='$HOOK_STDOUT' stderr='$HOOK_STDERR'"
+fi
+rm -f "$(state_dir_of "$cwd")"/*.state
+RUN_TERM=TERMINAL_STEP_TYPE run_hook "$cwd" "${tf_env[@]}"
+if [[ "$HOOK_STDOUT" == "{}" ]] && printf '%s' "$HOOK_STDERR" | grep -q -- '-  b = 2'; then
+  ok "unenforceable stop prints diagnostics to stderr and answers {}"
+else
+  bad "unenforceable diagnostics" "stdout='$HOOK_STDOUT' stderr='$HOOK_STDERR'"
+fi
+run_hook "$cwd" "${tf_env[@]}"
+assert_continue
+ok "findings only shown on stderr still enforce on the next normal stop"
+
+# Repeating the identical findings must downgrade to stderr ({}) instead of nagging twice,
+# and mark state failed_sent so a 3rd unchanged Stop skips L5 completely at L3.
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_DEBUG=true
+if [[ "$HOOK_STDOUT" == "{}" ]] \
+   && printf '%s' "$HOOK_STDERR" | grep -q -- '-  b = 2' \
+   && printf '%s' "$HOOK_STDERR" | grep -q 'findings unchanged since last continue'; then
+  ok "identical findings already sent do not force continue twice"
+else
+  bad "findings dedupe" "stdout='$HOOK_STDOUT' stderr='$HOOK_STDERR'"
+fi
+rm -f "$(calls_of "$cwd")"
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_DEBUG=true
+assert_noop
+[[ ! -f "$(calls_of "$cwd")" ]] && ok "third Stop on unchanged tree skips L5 after dedupe" \
+  || bad "post-dedupe L3 skip" "stub ran: $(cat "$(calls_of "$cwd")")"
+printf '%s' "$HOOK_STDERR" | grep -q 'L3: unchanged since last run (verdict: failed_sent)' \
+  && ok "trace reports L3 skip with verdict: failed_sent" \
+  || bad "failed_sent trace" "stderr='$HOOK_STDERR'"
+
+# Touching a relevant file exits the failed_sent idle state and re-lints.
+sleep 1; echo '# edited after dedupe' >> "$cwd/main.tf"
+run_hook "$cwd" "${tf_env[@]}"
+assert_noop
+[[ -f "$(calls_of "$cwd")" ]] && ok "touching a relevant file after failed_sent re-lints" \
+  || bad "post-dedupe touch missed" "stderr='$HOOK_STDERR'"
+
+# A change in the truncated head (cut by EXCERPT_CHARS) must still count as new.
+rm -f "$(state_dir_of "$cwd")"/*.state
+{ echo 'HEAD-ONE'; seq -f 'same-tail-line-%02g' 1 10; } > "$stub_dir/msg"
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_EXCERPT_CHARS=80
+assert_continue
+{ echo 'HEAD-TWO'; seq -f 'same-tail-line-%02g' 1 10; } > "$stub_dir/msg"
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_EXCERPT_CHARS=80
+if printf '%s' "$HOOK_STDOUT" | jq -e '.decision == "continue"' >/dev/null 2>&1; then
+  ok "findings that differ only past EXCERPT_CHARS truncation still enforce"
+else
+  bad "dedupe beyond excerpt cap" "stdout='$HOOK_STDOUT'"
+fi
+
+# Reset 1: a clean lint pass clears .findings, so recurring findings enforce again.
+mk_stub "$stub_dir" terraform 'exit 0'
+run_hook "$cwd" "${tf_env[@]}"
+assert_noop
+mk_stub "$stub_dir" terraform 'if [[ "$*" == *"-check"* ]]; then cat "$(dirname "$0")/msg"; exit 3; fi' 'exit 0'
+sleep 1; echo '# touch' >> "$cwd/main.tf"
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_EXCERPT_CHARS=80
+if printf '%s' "$HOOK_STDOUT" | jq -e '.decision == "continue"' >/dev/null 2>&1; then
+  ok "clean lint pass resets dedupe so recurring findings enforce again"
+else
+  bad "dedupe reset on clean pass" "stdout='$HOOK_STDOUT'"
+fi
+
+# Reset 2: a clean working tree (L2) clears .findings too.
+( cd "$cwd" && git add -A && git commit -q -m fix )
+run_hook "$cwd" "${tf_env[@]}"
+assert_noop
+( cd "$cwd" && echo '# again' >> main.tf )
+run_hook "$cwd" "${tf_env[@]}" LINT_ENFORCER_EXCERPT_CHARS=80
+if printf '%s' "$HOOK_STDOUT" | jq -e '.decision == "continue"' >/dev/null 2>&1; then
+  ok "clean working tree resets dedupe so recurring findings enforce again"
+else
+  bad "dedupe reset on clean tree" "stdout='$HOOK_STDOUT'"
+fi
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Time budget (LINT_ENFORCER_BUDGET_SEC): slow tools cap and skip with 124"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox budget)
+( cd "$cwd" && git init -q && echo '' > a.tf && echo '' > b.tf && echo '' > c.tf )
+stub_dir=$(mktemp -d)
+# Portable timeout shim so the test does not depend on GNU coreutils on macOS.
+cat > "$stub_dir/timeout" <<'STUB'
+#!/bin/bash
+secs="$1"; shift
+"$@" &
+child=$!
+( sleep "$secs"; kill -TERM "$child" 2>/dev/null ) &
+watcher=$!
+wait "$child" 2>/dev/null
+rc=$?
+if kill -0 "$watcher" 2>/dev/null; then
+  kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+  exit $rc
+fi
+wait "$watcher" 2>/dev/null
+exit 124
+STUB
+chmod +x "$stub_dir/timeout"
+mk_stub "$stub_dir" terraform 'exec sleep 10'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform LINT_ENFORCER_BUDGET_SEC=2
+rm -rf "$stub_dir"
+assert_continue
+[[ $HOOK_MS -lt 5000 ]] && ok "stops at the 2s budget (${HOOK_MS}ms instead of 60s)" \
+  || bad "budget duration" "took ${HOOK_MS}ms"
+reason=$(printf '%s' "$HOOK_STDOUT" | jq -r '.reason')
+printf '%s' "$reason" | grep -q 'timed out; output may be partial' \
+  && ok "reason marks exit 124 as timed out" || bad "timeout note" "reason='$reason'"
+printf '%s' "$reason" | grep -q 'time budget is used up' \
+  && ok "reason reports checks skipped after budget exhaustion" || bad "budget skip msg" "reason='$reason'"
+
+# ---------------------------------------------------------------------------
+hdr "Scope: linters receive only changed files (git: modified, renamed, untracked dir)"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox scope-git)
+( cd "$cwd" && git init -q && git config user.email t@t && git config user.name t \
+  && printf '[project]\nname="x"\nversion="0"\n' > pyproject.toml \
+  && echo 'x = 1' > a.py && echo 'y = 1' > untouched.py \
+  && echo 'o = 1' > old.py && echo 'd = 1' > deleted.py \
+  && printf 'FROM alpine:3.20\n' > Dockerfile \
+  && printf 'FROM alpine:3.20\n' > Dockerfile.untouched \
+  && mkdir -p .github/workflows \
+  && printf 'name: ci\non: push\n' > .github/workflows/ci.yml \
+  && printf 'name: keep\non: push\n' > .github/workflows/untouched.yml \
+  && git add -A && git commit -q -m init \
+  && echo 'x = 2' > a.py \
+  && git mv old.py renamed.py \
+  && rm deleted.py \
+  && mkdir -p pkg/new && echo 'c = 1' > pkg/new/c.py \
+  && printf 'FROM alpine:3.20\nRUN echo hi\n' > Dockerfile \
+  && printf 'name: ci\non: [push]\n' > .github/workflows/ci.yml \
+  && mkdir -p .github/workflows/nested && echo 'k: v' > .github/workflows/nested/helper.yml )
+stub_dir=$(mktemp -d)
+call_dir="$SANDBOX_ROOT/scope-git.calls"
+for tool in uv hadolint actionlint; do
+  mk_stub "$stub_dir" "$tool" "printf '%s\n' \"\$*\" >> \"$call_dir/$tool\"" 'exit 0'
+done
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv,dockerfile,github_actions
+uv_args=$(cat "$call_dir/uv" 2>/dev/null)
+if [[ "$uv_args" == *"ruff check --fix --force-exclude ./a.py"* \
+   && "$uv_args" == *"ruff format --force-exclude ./a.py"* \
+   && "$uv_args" == *"ruff check --force-exclude ./a.py"* \
+   && "$uv_args" == *"./renamed.py"* && "$uv_args" == *"./pkg/new/c.py"* ]]; then
+  ok "python: ruff gets modified, renamed, and new-dir files with --force-exclude"
+else
+  bad "py scope include" "args: $uv_args"
+fi
+if [[ "$uv_args" != *untouched.py* && "$uv_args" != *old.py* && "$uv_args" != *deleted.py* ]] \
+   && ! grep -q ' \.$' "$call_dir/uv"; then
+  ok "python: untouched, rename-source, deleted files, and '.' excluded"
+else
+  bad "py scope exclude" "args: $uv_args"
+fi
+hl_args=$(cat "$call_dir/hadolint" 2>/dev/null)
+if [[ "$hl_args" == "./Dockerfile" ]]; then
+  ok "docker: hadolint gets only changed ./Dockerfile (not Dockerfile.untouched)"
+else
+  bad "docker scope" "args: $hl_args"
+fi
+gha_args=$(cat "$call_dir/actionlint" 2>/dev/null)
+if [[ "$gha_args" == "./.github/workflows/ci.yml" ]]; then
+  ok "github_actions: actionlint gets only changed top-level workflow (not untouched or nested)"
+else
+  bad "gha scope" "args: $gha_args"
+fi
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Scope: monorepo sub-directory rebases porcelain -z paths and drops outside files"
+# ---------------------------------------------------------------------------
+repo=$(mk_sandbox scope-monorepo)
+mkdir -p "$repo/svc-a" "$repo/svc-b" "$SANDBOX_ROOT/svc-b-scope.state" "$SANDBOX_ROOT/svc-b-scope.calls"
+printf '[project]\nname="a"\nversion="0"\n' > "$repo/svc-a/pyproject.toml"
+printf '[project]\nname="b"\nversion="0"\n' > "$repo/svc-b/pyproject.toml"
+echo 'a = 1' > "$repo/svc-a/a.py"
+echo 'b = 1' > "$repo/svc-b/b.py"
+echo 'u = 1' > "$repo/svc-b/untouched.py"
+git_sandbox "$repo" "echo 'a = 2' > svc-a/a.py && echo 'b = 2' > svc-b/b.py"
+stub_dir=$(mktemp -d)
+sub_calls="$SANDBOX_ROOT/svc-b-scope.calls/uv"
+mk_stub "$stub_dir" uv "printf '%s\n' \"\$*\" >> \"$sub_calls\"" 'exit 0'
+run_hook "$repo/svc-b" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv \
+  LINT_ENFORCER_STATE_DIR="$SANDBOX_ROOT/svc-b-scope.state"
+uv_sub=$(cat "$sub_calls" 2>/dev/null)
+if [[ "$uv_sub" == *"ruff check --force-exclude ./b.py"* \
+   && "$uv_sub" != *svc-b* && "$uv_sub" != *a.py* && "$uv_sub" != *untouched.py* ]]; then
+  ok "sub-directory workspace: rebased to ./b.py, sibling and untouched files excluded"
+else
+  bad "subdir scope" "args: $uv_sub"
+fi
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Scope: Spotless -DspotlessFiles, spring-javaformat project-wide, and terraform/tflint args"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox scope-jvm-tf)
+( cd "$cwd" && git init -q && git config user.email t@t && git config user.name t \
+  && echo '<project>spotless-maven-plugin</project>' > pom.xml \
+  && mkdir -p src mod cleanmod \
+  && echo 'class A {}' > src/A.java && echo 'class B {}' > src/B.java \
+  && echo '' > main.tf && echo '' > untouched.tf \
+  && echo '' > mod/a.tf && echo '' > mod/b.tf && echo '' > cleanmod/c.tf \
+  && git add -A && git commit -q -m init \
+  && echo '// x' >> src/A.java && echo '# x' >> main.tf \
+  && echo '# x' >> mod/a.tf && echo '# x' >> mod/b.tf )
+stub_dir=$(mktemp -d)
+call_dir="$SANDBOX_ROOT/scope-jvm-tf.calls"
+for tool in mvn terraform tflint; do
+  mk_stub "$stub_dir" "$tool" "printf '%s\n' \"\$*\" >> \"$call_dir/$tool\"" 'exit 0'
+done
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=spring_maven,terraform
+phys_cwd=$(cd "$cwd" && pwd -P)
+# shellcheck disable=SC1003  # backslashes match literal \Q...\E regex quoting
+if grep -q -F -- "-DspotlessFiles=\\Q$phys_cwd/src/A.java\\E" "$call_dir/mvn" 2>/dev/null \
+   && ! grep -q 'B.java' "$call_dir/mvn"; then
+  ok "spotless: -DspotlessFiles anchors changed Java file's full path and excludes B.java"
+else
+  bad "spotless scope" "args: $(cat "$call_dir/mvn" 2>/dev/null)"
+fi
+tf_args=$(cat "$call_dir/terraform" 2>/dev/null)
+if [[ "$tf_args" == *"fmt ./main.tf"* && "$tf_args" == *"fmt -check -diff ./mod/a.tf"* \
+   && "$tf_args" != *-recursive* && "$tf_args" != *untouched.tf* && "$tf_args" != *cleanmod* ]]; then
+  ok "terraform fmt: receives individual changed files, never -recursive or untouched files"
+else
+  bad "terraform fmt scope" "args: $tf_args"
+fi
+tflint_args=$(cat "$call_dir/tflint" 2>/dev/null)
+if [[ "$tflint_args" == $'--chdir=.\n--chdir=./mod' ]]; then
+  ok "tflint: runs once per changed directory (--chdir=. and --chdir=./mod)"
+else
+  bad "tflint scope" "args: $tflint_args"
+fi
+
+# spring-javaformat exception: no file filter exists, so mvn runs project-wide.
+rm -f "$call_dir/mvn" "$(state_dir_of "$cwd")"/*
+echo '<project>spring-javaformat</project>' > "$cwd/pom.xml"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=spring_maven
+mvn_sjf=$(cat "$call_dir/mvn" 2>/dev/null)
+if [[ "$mvn_sjf" == "-q -B spring-javaformat:apply" ]]; then
+  ok "spring-javaformat: runs project-wide without -DspotlessFiles"
+else
+  bad "spring-javaformat scope" "args: $mvn_sjf"
+fi
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
+hdr "Scope (no-git): first run lints all files, later run lints only newer files"
+# ---------------------------------------------------------------------------
+cwd=$(mk_sandbox scope-nogit)
+echo 'resource "a" "a" {}' > "$cwd/a.tf"
+echo 'resource "b" "b" {}' > "$cwd/b.tf"
+stub_dir=$(mktemp -d)
+tf_calls="$SANDBOX_ROOT/scope-nogit.calls/tf"
+mk_stub "$stub_dir" terraform "printf '%s\n' \"\$*\" >> \"$tf_calls\"" 'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+first_tf=$(cat "$tf_calls" 2>/dev/null)
+if [[ "$first_tf" == *"./a.tf"* && "$first_tf" == *"./b.tf"* ]]; then
+  ok "no-git first run passes both existing .tf files"
+else
+  bad "no-git first scope" "args: $first_tf"
+fi
+rm -f "$tf_calls"
+sleep 1; echo '# edited' >> "$cwd/b.tf"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=terraform
+second_tf=$(cat "$tf_calls" 2>/dev/null)
+if [[ "$second_tf" == *"./b.tf"* && "$second_tf" != *"./a.tf"* ]]; then
+  ok "no-git subsequent run passes only the modified file (./b.tf)"
+else
+  bad "no-git incremental scope" "args: $second_tf"
+fi
+rm -rf "$stub_dir"
 
 # ---------------------------------------------------------------------------
 hdr "Summary"

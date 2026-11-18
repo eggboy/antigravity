@@ -21,7 +21,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "bash ./lint-enforcer/lint-enforcer.sh",
+        "command": "LINT_ENFORCER_SKIP_DIRS='' bash ./lint-enforcer/lint-enforcer.sh # SKIP_DIRS = colon list of repos to never lint, e.g. '~/Develop/git/investment-ai-new:~/Develop/git/agentic-mod-dotnet' (upstream agent-harness skips these two: autofix broke their hash-checked files). Leading ~ = $HOME; subdirs are skipped too, name-prefix siblings are not. Reload hooks after editing.",
         "timeout": 300
       }
     ]

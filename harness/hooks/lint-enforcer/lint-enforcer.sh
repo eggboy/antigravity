@@ -44,8 +44,9 @@
 # Scope: formatters and checks receive only the files changed in the working
 # tree (git: modified, staged, rename targets, untracked in new dirs; deletions
 # and paths outside the workspace dropped) or modified since the last run (no
-# git; all matching files on the first run). Exception: spring-javaformat has
-# no file filter and runs project-wide; Spotless uses -DspotlessFiles.
+# git; all matching files on the first run, and only implicated failing files
+# carried across runs). Exception: spring-javaformat has no file filter and
+# runs project-wide; Spotless uses -DspotlessFiles.
 #
 # Modes:
 #   block (default) enforcement: on findings answer decision:continue, but
@@ -296,6 +297,13 @@ fail() {
   clean_out=$(sanitize_out "$OUT")
   WS_FAILURES+=("$label")
   WS_SIG+="## $label $rc$NL$clean_out$NL"
+  case "$CUR_TC" in
+    spring) FAIL_SPRING=1; (( rc == 124 )) && TO_SPRING=1; OUT_SPRING+="${OUT_SPRING:+$NL}$clean_out" ;;
+    py)     FAIL_PY=1;     (( rc == 124 )) && TO_PY=1;     OUT_PY+="${OUT_PY:+$NL}$clean_out" ;;
+    tf)     FAIL_TF=1;     (( rc == 124 )) && TO_TF=1;     OUT_TF+="${OUT_TF:+$NL}$clean_out" ;;
+    docker) FAIL_DOCKER=1; (( rc == 124 )) && TO_DOCKER=1; OUT_DOCKER+="${OUT_DOCKER:+$NL}$clean_out" ;;
+    gha)    FAIL_GHA=1;    (( rc == 124 )) && TO_GHA=1;    OUT_GHA+="${OUT_GHA:+$NL}$clean_out" ;;
+  esac
   local hdr="--- $label"
   (( ${#WORKSPACES[@]} > 1 )) && hdr+=" @ ${HOOK_CWD##*/}"
   (( rc == 124 )) && body="(timed out; output may be partial)"
@@ -306,6 +314,44 @@ fail() {
   fi
   WS_DETAILS+="${WS_DETAILS:+$NL}$hdr ---$NL$body"
   note "$label"
+}
+
+# True when $2 (relative path or basename) appears in $1 bounded by characters
+# outside [A-Za-z0-9._-], avoiding substring false positives (a.tf in data.tf).
+mentions_name() {
+  local s="$1" needle="$2" pre post
+  [[ -n "$s" && -n "$needle" ]] || return 1
+  while [[ "$s" == *"$needle"* ]]; do
+    pre="${s%%"$needle"*}"
+    post="${s:${#pre}+${#needle}:1}"
+    if [[ ( -z "$pre" || ! "${pre:${#pre}-1:1}" =~ [A-Za-z0-9._-] ) \
+       && ( -z "$post" || ! "$post" =~ [A-Za-z0-9._-] ) ]]; then
+      return 0
+    fi
+    s="${s:${#pre}+1}"
+  done
+  return 1
+}
+
+# For a failing no-git toolchain, append implicated files (without "./") from
+# $@ to $IMPLICATED; fall back to all $@ on timeout (124) or unattributed output.
+collect_implicated() {
+  local timed_out="$1" tc_out="$2" f rel base matched=()
+  shift 2
+  if (( !timed_out )) && [[ -n "$tc_out" ]]; then
+    for f in "$@"; do
+      rel="${f#./}"
+      base="${rel##*/}"
+      if mentions_name "$tc_out" "$rel" || mentions_name "$tc_out" "$base"; then
+        matched+=("$rel")
+      fi
+    done
+  fi
+  if (( ${#matched[@]} > 0 )); then
+    for rel in "${matched[@]}"; do IMPLICATED+=("$rel"); done
+  else
+    for f in "$@"; do IMPLICATED+=("${f#./}"); done
+  fi
 }
 
 # Directory walks (no-git mtime gate) prune heavy dirs by name at any depth
@@ -627,12 +673,18 @@ lint_workspace() {
   # -------------------------------------------------------------------------
   # L5
   # -------------------------------------------------------------------------
-  WS_FAILURES=(); WS_DETAILS=""; WS_SIG=""
-  (( RUN_SPRING )) && run_spring
-  (( RUN_PY ))     && run_python
-  (( RUN_TF ))     && run_terraform
-  (( RUN_DOCKER )) && run_docker
-  (( RUN_GHA ))    && run_actions
+  WS_FAILURES=(); WS_DETAILS=""; WS_SIG=""; CUR_TC=""
+  FAIL_SPRING=0; TO_SPRING=0; OUT_SPRING=""
+  FAIL_PY=0;     TO_PY=0;     OUT_PY=""
+  FAIL_TF=0;     TO_TF=0;     OUT_TF=""
+  FAIL_DOCKER=0; TO_DOCKER=0; OUT_DOCKER=""
+  FAIL_GHA=0;    TO_GHA=0;    OUT_GHA=""
+  (( RUN_SPRING )) && { CUR_TC=spring; run_spring; }
+  (( RUN_PY ))     && { CUR_TC=py;     run_python; }
+  (( RUN_TF ))     && { CUR_TC=tf;     run_terraform; }
+  (( RUN_DOCKER )) && { CUR_TC=docker; run_docker; }
+  (( RUN_GHA ))    && { CUR_TC=gha;    run_actions; }
+  CUR_TC=""
 
   [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR" 2>/dev/null || true
   local n=${#WS_FAILURES[@]} i section verdict=clean deduped=0 sig_hash=""
@@ -651,13 +703,21 @@ lint_workspace() {
   fi
 
   # Remember the verdict with the status as it is now (formatter rewrites and
-  # any state/findings files inside a repo-local STATE_DIR included).
+  # any state/findings files inside a repo-local STATE_DIR included). Without
+  # git, keep only files implicated by failing toolchains so one bad file never
+  # forces later incremental runs to re-lint clean files.
   : > "$STATE_FILE" 2>/dev/null || true
   if (( HAS_GIT )); then
     collect_git_status 0
   elif (( n > 0 )); then
+    IMPLICATED=()
+    (( FAIL_SPRING )) && collect_implicated "$TO_SPRING" "$OUT_SPRING" "${JAVA_FILES[@]}"
+    (( FAIL_PY ))     && collect_implicated "$TO_PY"     "$OUT_PY"     "${PY_FILES[@]}"
+    (( FAIL_TF ))     && collect_implicated "$TO_TF"     "$OUT_TF"     "${TF_FILES[@]}"
+    (( FAIL_DOCKER )) && collect_implicated "$TO_DOCKER" "$OUT_DOCKER" "${DOCKER_FILES[@]}"
+    (( FAIL_GHA ))    && collect_implicated "$TO_GHA"    "$OUT_GHA"    "${GHA_FILES[@]}"
     PORC=""
-    for i in "${RELEVANT[@]}"; do PORC+="${PORC:+$NL}${i#./}"; done
+    for i in ${IMPLICATED[@]+"${IMPLICATED[@]}"}; do PORC+="${PORC:+$NL}$i"; done
   else
     PORC=""
   fi

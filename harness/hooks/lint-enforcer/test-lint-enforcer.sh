@@ -1108,6 +1108,61 @@ fi
 rm -rf "$stub_dir"
 
 # ---------------------------------------------------------------------------
+hdr "Scope (no-git): failing state retains only implicated files of failing toolchains"
+# ---------------------------------------------------------------------------
+# (a) 3 .py files, stub ruff fails naming only bad.py → state keeps only bad.py;
+#     touching good2.py next passes only good2.py + bad.py (not good1.py).
+cwd=$(mk_sandbox nogit-implicated)
+printf '[project]\nname="x"\nversion="0"\n' > "$cwd/pyproject.toml"
+echo 'x = 1' > "$cwd/good1.py"
+echo 'x = 2' > "$cwd/good2.py"
+echo 'x = 3' > "$cwd/bad.py"
+echo 'resource "a" "a" {}' > "$cwd/clean.tf"
+stub_dir=$(mktemp -d)
+call_dir="$SANDBOX_ROOT/nogit-implicated.calls"
+mk_stub "$stub_dir" terraform "printf '%s\n' \"\$*\" >> \"$call_dir/tf\"" 'exit 0'
+mk_stub "$stub_dir" uv "printf '%s\n' \"\$*\" >> \"$call_dir/uv\"" \
+  'if [[ "$*" == *"ruff check --force-exclude"* ]]; then echo "bad.py:1:1: F401 unused"; exit 1; fi' \
+  'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv,terraform
+assert_continue
+saved_paths=$(tail -n +2 "$(state_dir_of "$cwd")"/*.state)
+if [[ "$saved_paths" == "bad.py" ]]; then
+  ok "no-git state keeps only bad.py (drops good1.py, good2.py, and passing clean.tf)"
+else
+  bad "no-git implicated state" "saved_paths='$saved_paths'"
+fi
+[[ "$saved_paths" != *clean.tf* ]] && ok "passing toolchain's files (clean.tf) excluded from state" \
+  || bad "passing toolchain leaked" "saved_paths='$saved_paths'"
+
+rm -f "$call_dir/uv" "$call_dir/tf"
+sleep 1; echo '# edited' >> "$cwd/good2.py"
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv,terraform
+uv_next=$(grep '^run --no-sync ruff check --force-exclude ' "$call_dir/uv" 2>/dev/null)
+if [[ "$uv_next" == *"./good2.py"* && "$uv_next" == *"./bad.py"* && "$uv_next" != *"./good1.py"* ]] \
+   && [[ ! -f "$call_dir/tf" ]]; then
+  ok "touching good2.py lints only good2.py + bad.py (skips good1.py and passing terraform)"
+else
+  bad "no-git incremental merge" "uv='$uv_next' tf='$(cat "$call_dir/tf" 2>/dev/null)'"
+fi
+
+# (b) When a failing tool names no file in its output, retain all of that toolchain's files.
+rm -f "$(state_dir_of "$cwd")"/* "$call_dir/uv" "$call_dir/tf"
+mk_stub "$stub_dir" uv \
+  'if [[ "$*" == *"ruff check --force-exclude"* ]]; then echo "configuration error (no path)"; exit 2; fi' \
+  'exit 0'
+run_hook "$cwd" env PATH="$stub_dir:$BASE_PATH" LINT_ENFORCER_LANGS=python_uv,terraform
+assert_continue
+fallback_paths=$(tail -n +2 "$(state_dir_of "$cwd")"/*.state)
+if [[ "$fallback_paths" == *"good1.py"* && "$fallback_paths" == *"good2.py"* \
+   && "$fallback_paths" == *"bad.py"* && "$fallback_paths" != *"clean.tf"* ]]; then
+  ok "unattributed failure retains all files of the failing toolchain (and still drops passing clean.tf)"
+else
+  bad "no-git fallback state" "fallback_paths='$fallback_paths'"
+fi
+rm -rf "$stub_dir"
+
+# ---------------------------------------------------------------------------
 hdr "Summary"
 # ---------------------------------------------------------------------------
 printf '  PASS: %d   FAIL: %d\n\n' "$PASS" "$FAIL"

@@ -3,17 +3,22 @@
     "Stop": [
       {
         "type": "command",
-        "command": "if command -v afplay >/dev/null 2>&1; then (afplay -v 1.0 /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &) ; else tput bel >/dev/tty; fi; echo '{}'",
+        "command": "{ printf '\\a' >/dev/tty; } 2>/dev/null; if command -v afplay >/dev/null 2>&1; then (afplay -v 1.0 /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &) ; else tput bel >/dev/tty; fi; echo '{}'",
         "timeout": 10
       }
     ]
   },
-  "show-reasoning": {
-    "PostInvocation": [
+  "question-bell": {
+    "PreToolUse": [
       {
-        "type": "command",
-        "command": "python3 ./show-reasoning/show_reasoning.py --apps jetski,app,ide,cli",
-        "timeout": 10
+        "matcher": "ask_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{ printf '\\a' >/dev/tty; } 2>/dev/null; echo '{\"decision\":\"allow\"}'",
+            "timeout": 10
+          }
+        ]
       }
     ]
   },
@@ -21,7 +26,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "LINT_ENFORCER_SKIP_DIRS='' bash ./lint-enforcer/lint-enforcer.sh # SKIP_DIRS = colon list of repos to never lint, e.g. '~/Develop/git/investment-ai-new:~/Develop/git/agentic-mod-dotnet' (upstream agent-harness skips these two: autofix broke their hash-checked files). Leading ~ = $HOME; subdirs are skipped too, name-prefix siblings are not. Reload hooks after editing.",
+        "command": "bash /Users/jayleeg/Develop/git/antigravity/harness/hooks/lint-enforcer/lint-enforcer.sh",
         "timeout": 300
       }
     ]

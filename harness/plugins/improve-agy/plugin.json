@@ -1,0 +1,13 @@
+{
+  "name": "improve-agy",
+  "displayName": "Improve agy",
+  "description": "Mine local Antigravity and Jetski session transcripts for friction and turn it into 3 to 7 action items, each with evidence, a paste-ready fix and a verification metric.",
+  "version": "0.2.0",
+  "author": { "name": "Jay Lee", "url": "https://github.com/eggboy" },
+  "repository": "https://github.com/eggboy/antigravity",
+  "suggestedPrompts": [
+    "/improve-agy",
+    "What should I improve about how I work with the agent, based on the last 7 days?",
+    "Check whether the actions from my last improve-agy run moved their metrics"
+  ]
+}

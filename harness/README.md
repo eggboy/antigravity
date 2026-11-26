@@ -1,10 +1,11 @@
 # Antigravity harness
 
-Hooks and agent skills for Antigravity and Jetski. A hook is a shell command the host runs at a lifecycle event such as `Stop` or `PostInvocation`. A skill is a procedure the agent loads when its trigger matches, at zero context cost until then.
+Hooks, agent skills and plugins for Antigravity and Jetski. A hook is a shell command the host runs at a lifecycle event such as `Stop` or `PostInvocation`. A skill is a procedure the agent loads when its trigger matches, at zero context cost until then. A plugin bundles skills and other customizations behind one `plugin.json`, so they install as a unit.
 
 ```text
 hooks/     hooks.json plus one directory per hook
 skills/    one directory per skill, each with a SKILL.md
+plugins/   one directory per plugin, each with a plugin.json
 agents/    custom agent personas; empty so far
 ```
 
@@ -44,3 +45,30 @@ Each skill is a directory with a `SKILL.md`. The agent sees the name and descrip
 ### Install
 
 Copy or symlink `skills/<name>` into `~/.gemini/config/skills/` (all workspaces) or `<workspace>/.agents/skills/` (one project).
+
+## Plugins
+
+A plugin bundles skills, agents, rules, hooks and MCP servers behind one `plugin.json`, so you install, enable and disable them as a unit. [`plugins/improve-agy`](plugins/improve-agy) ships the `improve-agy` skill from the table above, with the same [requirements](#requirements).
+
+### Install
+
+From the `harness` directory of this checkout:
+
+```bash
+agy plugin install plugins/improve-agy
+agy plugin list
+```
+
+`install` copies the plugin to `~/.gemini/config/plugins/improve-agy`, where it loads in all workspaces, and `list` shows `improve-agy` as enabled. The agent picks the skill up on its next turn; type `/improve-agy` to run it. Re-run `install` after a `git pull` to replace the copy. The `jetski` CLI takes the same `plugin` subcommands.
+
+To make the install follow this checkout, symlink it:
+
+```bash
+mkdir -p ~/.gemini/config/plugins
+ln -s "$PWD/plugins/improve-agy" ~/.gemini/config/plugins/improve-agy
+```
+
+For one project, copy or symlink the directory into `<workspace>/.agents/plugins/`.
+
+> [!NOTE]
+> Pick one: the plugin, or the loose skill from [Agent skills](#agent-skills). The agent loads a single skill named `improve-agy`, so a stale copy in `~/.gemini/config/skills/` can shadow the plugin's.
